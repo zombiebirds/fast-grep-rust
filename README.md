@@ -2,7 +2,7 @@
 
 > Indexed regex search. 6–25x faster than ripgrep, 2–10x faster than ugrep.
 
-Built for agent harnesses and large codebases where grep is the bottleneck. A one-time index build turns every subsequent search into a sub-200ms lookup instead of a multi-second full scan.
+Built at **[GeneXus](https://www.genexus.com)** for agent harnesses and large codebases where grep is the bottleneck. A one-time index build turns every subsequent search into a sub-200ms lookup instead of a multi-second full scan. An optional background daemon keeps the index in sync with the filesystem so it never goes stale.
 
 ## Benchmarks — Linux kernel 6.6 (81,690 files)
 
@@ -108,7 +108,7 @@ scoop install fast-grep
 A `.deb` package is attached to every release for `amd64` and `arm64`:
 
 ```bash
-curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.1.0-1_amd64.deb
+curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.2.0-1_amd64.deb
 sudo dpkg -i fast-grep_*_amd64.deb
 ```
 
@@ -153,12 +153,37 @@ fgr search "EXPORT_SYMBOL" /path/to/codebase --index .fgr
 # Search without index (ripgrep-equivalent full scan)
 fgr search "EXPORT_SYMBOL" /path/to/codebase
 
+# Incrementally update an existing index after files changed
+fgr update /path/to/codebase --index .fgr
+
 # Benchmark against ripgrep
 fgr bench "static.*inline" /path/to/codebase
 
 # Index stats
 fgr stats --index .fgr
 ```
+
+### Daemon mode (auto-incremental updates)
+
+Run a background watcher that observes filesystem changes and applies
+debounced incremental index updates. Searches automatically flush pending
+changes before running, so the index never lags behind your edits.
+
+```bash
+# Build index and start the daemon in one step
+fgr index /path/to/codebase --output .fgr --daemon
+
+# Or start the daemon against an existing index
+fgr daemon start /path/to/codebase --output .fgr
+
+# Status / stop
+fgr daemon status /path/to/codebase --output .fgr
+fgr daemon stop   /path/to/codebase --output .fgr
+```
+
+The daemon debounces FS events by 3 seconds, so a burst of writes triggers a
+single update. State is exchanged over a localhost TCP socket recorded in
+`<index>/daemon.port`.
 
 ### Flags
 
@@ -182,6 +207,10 @@ LLM coding agents (Cursor, Claude Code, Aider) spend significant time grepping l
 | [ugrep](https://github.com/Genivia/ugrep) | Index + scan | Previously fastest indexed grep |
 | [zoekt](https://github.com/sourcegraph/zoekt) | Trigram index (Go) | Powers Sourcegraph |
 | [Cursor](https://cursor.com/blog/fast-regex-search) | Sparse n-gram (closed) | Inspiration for this project |
+
+## Credits
+
+Created and maintained at **[GeneXus](https://www.genexus.com)**.
 
 ## License
 

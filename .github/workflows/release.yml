@@ -196,7 +196,10 @@ jobs:
 
       - name: Build .deb
         shell: bash
-        run: cargo deb --no-build --target ${{ matrix.target }}
+        # --no-strip avoids invoking the host's x86_64 strip on the foreign-arch
+        # binary; it stays unstripped, which is fine — debug info is already off
+        # in `[profile.release]` (we set lto/codegen-units, not strip=true).
+        run: cargo deb --no-build --no-strip --target ${{ matrix.target }}
 
       - name: Stage .deb
         id: stage

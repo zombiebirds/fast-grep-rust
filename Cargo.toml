@@ -1,8 +1,11 @@
 [package]
 name = "fast-grep"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["Gaston Milano <gmilano@genexus.com>"]
+authors = [
+    "Gaston Milano <gmilano@genexus.com>",
+    "Gustavo Brown Rodriguez <gustavo.brown@globant.com>",
+]
 description = "Indexed regex search. 6-25x faster than ripgrep on large codebases via sparse n-gram index, position masks, and mmap'd posting lists."
 license = "MIT"
 repository = "https://github.com/gmilano/fast-grep-rust"
@@ -46,6 +49,9 @@ base64 = "0.21"
 notify = { version = "7", optional = true }
 ctrlc = { version = "3", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
 objc = "0.2"
@@ -77,7 +83,9 @@ fast-grep (fgr) is an indexed regex search tool. It builds a persistent
 sparse n-gram index over a codebase so that subsequent searches become
 sub-200ms lookups instead of multi-second full scans. Without an index it
 falls back to a ripgrep-equivalent parallel scan."""
-depends = "$auto"
+# Hardcoded so cross-arch .deb builds don't depend on dpkg-shlibdeps
+# resolving foreign-arch shared libs on the build host.
+depends = "libc6"
 section = "utils"
 priority = "optional"
 assets = [
