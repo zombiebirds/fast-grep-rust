@@ -1,2 +1,5 @@
 /target
 .fgr/
+
+# stray PDFs (briefs, exports) — keep them out of the public repo
+*.pdf
