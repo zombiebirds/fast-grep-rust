@@ -260,6 +260,20 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
 }
 
 fn run_indexed_search(pattern: &str, idx_path: &std::path::Path, search_path: &std::path::Path, opts: &SearchOpts) -> Result<()> {
+    // Auto-build the index on first use. We detect "no index" by the absence of
+    // meta.json (the same probe persist::load uses internally). The build root
+    // is the search PATH the user passed — this matches the natural intent
+    // "give me a fast search over this directory."
+    if !idx_path.join("meta.json").exists() {
+        eprintln!(
+            "Index not found at {} — building one-time (subsequent searches will be <200ms)…",
+            idx_path.display()
+        );
+        let build_start = Instant::now();
+        persist::build(search_path, idx_path, opts.no_ignore, opts.file_type.as_deref(), true)?;
+        eprintln!("Index built in {:.2}s", build_start.elapsed().as_secs_f64());
+    }
+
     // If a daemon is managing this index, ensure it's up-to-date before searching
     #[cfg(feature = "daemon")]
     if crate::daemon::is_daemon_running(idx_path) {
