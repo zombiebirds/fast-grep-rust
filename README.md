@@ -1,6 +1,7 @@
 # fast-grep
 
 > Indexed regex search. 6–25x faster than ripgrep, 2–10x faster than ugrep.
+> **Interactive walkthrough + C4 diagrams + benchmarks → [gmilano.github.io/fast-grep-rust](https://gmilano.github.io/fast-grep-rust/)**
 
 Built at **[GeneXus](https://www.genexus.com)** for agent harnesses and large codebases where grep is the bottleneck. A one-time index build turns every subsequent search into a sub-200ms lookup instead of a multi-second full scan. An optional background daemon keeps the index in sync with the filesystem so it never goes stale.
 
