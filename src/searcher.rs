@@ -604,6 +604,7 @@ impl Searcher {
 pub fn search_persistent_count(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
+    path_filter: Option<&Path>,
 ) -> Result<(usize, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
@@ -620,6 +621,11 @@ pub fn search_persistent_count(
             }
             let mut by_file: HashMap<&Path, Vec<u32>> = HashMap::new();
             for hit in &hits {
+                if let Some(filter) = path_filter {
+                    if !hit.path.starts_with(filter) {
+                        continue;
+                    }
+                }
                 by_file.entry(hit.path).or_default().push(hit.byte_offset);
             }
             let total_line_hits = hits.len();
@@ -668,10 +674,20 @@ pub fn search_persistent_count(
             }
         }
         SearchResult::BitmapFiles(paths) => {
-            count_file_level(&matcher, &paths, &mut timing, "bitmap-only", lbl)
+            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
+                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
+            } else {
+                paths
+            };
+            count_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
-            count_file_level(&matcher, &paths, &mut timing, "file-level (fallback)", lbl)
+            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
+                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
+            } else {
+                paths
+            };
+            count_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
         }
     };
 
@@ -724,13 +740,14 @@ pub fn search_persistent(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
 ) -> Result<Vec<Match>> {
-    Ok(search_persistent_timed(index, pattern)?.0)
+    Ok(search_persistent_timed(index, pattern, None)?.0)
 }
 
 /// Search with detailed timing breakdown. Uses line-level verify when index provides line hits.
 pub fn search_persistent_timed(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
+    path_filter: Option<&Path>,
 ) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
@@ -784,6 +801,11 @@ pub fn search_persistent_timed(
             // Group by file path for efficient mmap (one mmap per file)
             let mut by_file: HashMap<&Path, Vec<(u32, u32)>> = HashMap::new();
             for hit in &hits {
+                if let Some(filter) = path_filter {
+                    if !hit.path.starts_with(filter) {
+                        continue;
+                    }
+                }
                 by_file
                     .entry(hit.path)
                     .or_default()
@@ -913,10 +935,20 @@ pub fn search_persistent_timed(
             }
         }
         SearchResult::BitmapFiles(paths) => {
-            verify_file_level(&matcher, &paths, &mut timing, "bitmap-only", lbl)
+            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
+                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
+            } else {
+                paths
+            };
+            verify_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
         }
         SearchResult::AllFiles(paths) => {
-            verify_file_level(&matcher, &paths, &mut timing, "file-level (fallback)", lbl)
+            let filtered: Vec<&Path> = if let Some(filter) = path_filter {
+                paths.into_iter().filter(|p| p.starts_with(filter)).collect()
+            } else {
+                paths
+            };
+            verify_file_level(&matcher, &filtered, &mut timing, "file-level (fallback)", lbl)
         }
     };
 

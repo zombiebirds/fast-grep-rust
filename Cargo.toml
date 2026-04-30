@@ -43,6 +43,8 @@ anyhow = "1"
 memchr = "2"
 aho-corasick = "1"
 base64 = "0.21"
+notify = { version = "7", optional = true }
+ctrlc = { version = "3", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.29"
@@ -56,6 +58,10 @@ toml = "0.8"
 [[bench]]
 name = "search"
 harness = false
+
+[features]
+default = ["daemon"]
+daemon = ["dep:notify", "dep:ctrlc"]
 
 [profile.release]
 lto = true
