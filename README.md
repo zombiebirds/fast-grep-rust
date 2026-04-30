@@ -108,7 +108,7 @@ scoop install fast-grep
 A `.deb` package is attached to every release for `amd64` and `arm64`:
 
 ```bash
-curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.2.0-1_amd64.deb
+curl -LO https://github.com/gmilano/fast-grep-rust/releases/latest/download/fast-grep_0.2.1-1_amd64.deb
 sudo dpkg -i fast-grep_*_amd64.deb
 ```
 
@@ -143,15 +143,18 @@ In the meantime, `cargo install fast-grep` works on all of them.
 
 ## Usage
 
+Searching is the default — pass PATTERN and PATH as positional args. Other
+operations (`index`, `update`, `bench`, `stats`, `daemon`) are subcommands.
+
 ```bash
 # Build index (one-time, ~60s for Linux kernel)
 fgr index /path/to/codebase --output .fgr
 
 # Search with index
-fgr search "EXPORT_SYMBOL" /path/to/codebase --index .fgr
+fgr "EXPORT_SYMBOL" /path/to/codebase --index .fgr
 
 # Search without index (ripgrep-equivalent full scan)
-fgr search "EXPORT_SYMBOL" /path/to/codebase
+fgr "EXPORT_SYMBOL" /path/to/codebase
 
 # Incrementally update an existing index after files changed
 fgr update /path/to/codebase --index .fgr
