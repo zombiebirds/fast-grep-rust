@@ -90,15 +90,21 @@ inputs = sys.argv[2:]
 def sh(cmd):
     return subprocess.check_output(cmd, shell=True, text=True).strip()
 
+# Redact host-identifying details by default. Result files are meant to be
+# committed to a public repo, so we keep only the corpus basename for
+# context and substitute the hostname. Set FGR_BENCH_RAW_CTX=1 if you want
+# the raw values for personal/local use.
+raw = os.environ.get("FGR_BENCH_RAW_CTX") == "1"
+corpus_env = os.environ.get("CORPUS", "(default)")
 context = {
     "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "git_sha": sh("git rev-parse HEAD"),
     "git_short": sh("git rev-parse --short HEAD"),
     "git_dirty": sh("git status --porcelain") != "",
     "fgr_version": sh(f"{os.environ.get('FGR_BIN', 'target/release/fgr')} --version"),
-    "hostname": platform.node(),
+    "hostname": platform.node() if raw else "<redacted>",
     "platform": platform.platform(),
-    "corpus": os.environ.get("CORPUS", "(default)"),
+    "corpus": corpus_env if raw else (os.path.basename(corpus_env.rstrip("/")) or "<redacted>"),
 }
 
 results = []

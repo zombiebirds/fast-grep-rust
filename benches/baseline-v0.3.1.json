@@ -5,9 +5,9 @@
     "git_short": "080f0e2",
     "git_dirty": true,
     "fgr_version": "fgr 0.3.1",
-    "hostname": "UY-IT03576",
+    "hostname": "<redacted>",
     "platform": "macOS-26.4.1-arm64-arm-64bit",
-    "corpus": "/Users/gaston.milano/os.glob.ai/os.agents.coding/coda-desktop"
+    "corpus": "coda-desktop"
   },
   "results": [
     {

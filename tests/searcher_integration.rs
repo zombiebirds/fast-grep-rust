@@ -43,7 +43,7 @@ app.listen(3000, () => console.log('Server running'));",
         r#"{
   "database": { "host": "localhost", "port": 5432 },
   "redis": { "host": "localhost", "port": 6379 },
-  "apiKey": "sk-test-12345"
+  "apiKey": "<placeholder-not-a-real-key>"
 }"#,
     ),
     (
