@@ -122,6 +122,11 @@ Rebuild after moves.
 
 ## Index lifecycle
 
+**Before the first `fgr index` in a new repo:** make sure `.fgr/` is listed
+in `.gitignore`. Index files can be hundreds of MB (postings + bitmaps) and
+must never be committed. If `.gitignore` is missing the entry, add it before
+running `fgr index`.
+
 | Operation | Command | Cost |
 |---|---|---|
 | One-time build | `fgr index . [--output .fgr]` | ~60s for 80k files |
