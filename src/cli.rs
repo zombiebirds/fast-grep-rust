@@ -26,6 +26,8 @@ struct SearchOpts {
     no_ignore: bool,
     hidden: bool,
     file_type: Option<String>,
+    /// Force the grouped (heading) output format on/off. None = follow TTY.
+    heading_override: Option<bool>,
     /// Effective regex pattern (may have (?i) prefix etc.) — used by the TTY
     /// renderer to highlight matched substrings.
     pattern: Option<String>,
@@ -125,6 +127,14 @@ pub struct Cli {
     /// Include hidden files and directories (dotfiles like .git, .github)
     #[arg(short = '.', long = "hidden", global = true)]
     pub hidden: bool,
+
+    /// Group results under a file-name heading (default when stdout is a TTY)
+    #[arg(long = "heading", global = true, overrides_with = "no_heading")]
+    pub heading: bool,
+
+    /// Print one match per line as `path:line:content` (default when stdout is piped)
+    #[arg(short = 'N', long = "no-heading", global = true, overrides_with = "heading")]
+    pub no_heading: bool,
 
     /// Filter by file extension (e.g., --type rs)
     #[arg(long = "type", value_name = "EXT", global = true)]
@@ -226,6 +236,17 @@ pub fn run() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // overrides_with on the flags means clap surfaces only one of them as
+    // true — whichever was passed last on the CLI. None here means neither
+    // was set, so the renderer falls back to TTY auto-detect.
+    let heading_override = if cli.no_heading {
+        Some(false)
+    } else if cli.heading {
+        Some(true)
+    } else {
+        None
+    };
+
     let opts = SearchOpts {
         count: cli.count,
         files_only: cli.files_only,
@@ -233,6 +254,7 @@ pub fn run() -> Result<()> {
         no_ignore: cli.no_ignore,
         hidden: cli.hidden,
         file_type: cli.file_type.clone(),
+        heading_override,
         pattern: None, // populated below once the effective pattern is built
     };
 
@@ -279,6 +301,21 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// Effective grouping mode: explicit --heading / --no-heading wins; otherwise
+/// auto-detect from the TTY.
+fn use_heading(opts: &SearchOpts) -> bool {
+    opts.heading_override
+        .unwrap_or_else(|| std::io::stdout().is_terminal())
+}
+
+/// Whether to emit ANSI colour escapes. Strictly TTY-driven so a forced
+/// `--heading` while piped (`fgr --heading | less -R` excepted) doesn't
+/// leak raw escape sequences into a non-terminal sink. Heading and colour
+/// are independent: you can group without colour and colour without group.
+fn use_color() -> bool {
+    std::io::stdout().is_terminal()
+}
+
 fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) -> Result<()> {
     // For count/files-only/quiet, use the collecting API
     if opts.count || opts.files_only || opts.quiet {
@@ -295,10 +332,12 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         return Ok(());
     }
 
-    // TTY path: collect matches, then render grouped+colored. The collecting
-    // overhead is negligible compared to the regex+IO, and grouped rendering
-    // requires sorted-by-file matches anyway.
-    if std::io::stdout().is_terminal() {
+    // Buffered path: collect matches, then render via output_matches. Used
+    // when we need either grouped output (heading) or ANSI colour, since the
+    // streaming path below is byte-for-byte raw and can't decorate output.
+    // Streaming is only an option when both heading and colour are off, i.e.
+    // a piped `path:line:content` consumer like grep/awk pipelines.
+    if use_heading(opts) || use_color() {
         let start = Instant::now();
         let mut matches = searcher::search_full_scan(dir, pattern, opts.no_ignore, opts.hidden, opts.file_type.as_deref())?;
         // Stable sort by path so streaming-order races don't interleave files
@@ -312,7 +351,7 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         return Ok(());
     }
 
-    // Piped path: streaming `path:line:content` for grep-compatible pipelines.
+    // Flat path: streaming `path:line:content` for grep-compatible pipelines.
     let start = Instant::now();
     let output = std::sync::Mutex::new(std::io::BufWriter::new(std::io::stdout()));
     let count = searcher::search_full_scan_streaming(
@@ -392,7 +431,7 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
         for m in matches { *counts.entry(&m.path).or_insert(0) += 1; }
         let mut pairs: Vec<_> = counts.into_iter().collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
-        let tty = std::io::stdout().is_terminal();
+        let tty = use_color();
         for (path, count) in pairs {
             if tty {
                 println!("{}{}{}{}:{}{}{}", C_BOLD, C_PATH, path.display(), C_RESET, C_LINENO, count, C_RESET);
@@ -405,7 +444,7 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
     if opts.files_only {
         let mut files: Vec<_> = matches.iter().map(|m| &m.path).collect();
         files.sort(); files.dedup();
-        let tty = std::io::stdout().is_terminal();
+        let tty = use_color();
         for f in files {
             if tty {
                 println!("{}{}{}{}", C_BOLD, C_PATH, f.display(), C_RESET);
@@ -417,23 +456,76 @@ fn output_matches(matches: &[searcher::Match], opts: &SearchOpts) -> Result<()> 
     }
 
     let stdout = std::io::stdout();
-    let tty = stdout.is_terminal();
     let mut out = std::io::BufWriter::new(stdout.lock());
-    if tty {
-        write_grouped_matches(&mut out, matches, opts.pattern.as_deref())?;
+    let color = use_color();
+    if use_heading(opts) {
+        write_grouped_matches(&mut out, matches, opts.pattern.as_deref(), color)?;
     } else {
+        write_flat_matches(&mut out, matches, opts.pattern.as_deref(), color)?;
+    }
+    Ok(())
+}
+
+/// grep-style flat output: `path:line:content` per match. When `color` is
+/// true we wrap the path, line number, and matched substring in ANSI codes
+/// (mirroring ripgrep's --no-heading on a TTY); otherwise the bytes are
+/// plain text — same shape as the streaming path so downstream tools see
+/// identical output regardless of which render path served the request.
+fn write_flat_matches<W: Write>(
+    out: &mut W,
+    matches: &[searcher::Match],
+    pattern: Option<&str>,
+    color: bool,
+) -> Result<()> {
+    if !color {
         for m in matches {
             let _ = writeln!(out, "{}:{}:{}", m.path.display(), m.line_number, m.line);
         }
+        return Ok(());
+    }
+
+    let re = pattern.and_then(|p| regex::Regex::new(p).ok());
+    let mut hl_buf = String::with_capacity(256);
+
+    for m in matches {
+        let rendered: &str = if let Some(ref r) = re {
+            hl_buf.clear();
+            highlight_into(&m.line, r, &mut hl_buf);
+            hl_buf.as_str()
+        } else {
+            m.line.as_str()
+        };
+        let _ = writeln!(
+            out,
+            "{}{}{}{}:{}{}{}:{}",
+            C_BOLD, C_PATH, m.path.display(), C_RESET,
+            C_LINENO, m.line_number, C_RESET,
+            rendered,
+        );
     }
     Ok(())
+}
+
+/// Helper: returns the ANSI sequence if `color` is true, else `""`. Lets the
+/// renderer share one code path for both coloured and plain output without
+/// branching on every write.
+#[inline]
+fn ansi(seq: &'static str, color: bool) -> &'static str {
+    if color { seq } else { "" }
 }
 
 /// ripgrep-style grouped output: file path on its own line, then each match
 /// indented as `<lineno>: <content>` with the matched substring highlighted.
 /// Improves on rg by right-aligning line numbers within each file group, so a
 /// file that contains both line 3 and line 1042 renders cleanly aligned.
-fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pattern: Option<&str>) -> Result<()> {
+/// `color` gates ANSI escapes: heading layout stays the same when off, only
+/// the colour codes are suppressed (e.g. `fgr --heading | cat`).
+fn write_grouped_matches<W: Write>(
+    out: &mut W,
+    matches: &[searcher::Match],
+    pattern: Option<&str>,
+    color: bool,
+) -> Result<()> {
     // Compile the regex once for highlight-position lookups. If pattern is
     // None or doesn't compile, we still print the line — just unhighlighted.
     let re = pattern.and_then(|p| regex::Regex::new(p).ok());
@@ -442,6 +534,12 @@ fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pat
     // regex can be applied. For the no-regex fallback we just write `m.line`
     // by reference, no clone needed.
     let mut hl_buf = String::with_capacity(256);
+
+    let bold = ansi(C_BOLD, color);
+    let dim = ansi(C_DIM, color);
+    let reset = ansi(C_RESET, color);
+    let path_c = ansi(C_PATH, color);
+    let lineno_c = ansi(C_LINENO, color);
 
     let mut current: Option<&std::path::Path> = None;
     let mut i = 0;
@@ -459,10 +557,10 @@ fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pat
         if current.is_some() {
             let _ = writeln!(out);
         }
-        let _ = writeln!(out, "{}{}{}{}", C_BOLD, C_PATH, path.display(), C_RESET);
+        let _ = writeln!(out, "{}{}{}{}", bold, path_c, path.display(), reset);
 
         for m in &matches[i..j] {
-            let rendered: &str = if let Some(ref r) = re {
+            let rendered: &str = if let (Some(ref r), true) = (&re, color) {
                 hl_buf.clear();
                 highlight_into(&m.line, r, &mut hl_buf);
                 hl_buf.as_str()
@@ -472,8 +570,8 @@ fn write_grouped_matches<W: Write>(out: &mut W, matches: &[searcher::Match], pat
             let _ = writeln!(
                 out,
                 "{}{:>w$}{}{}:{} {}",
-                C_LINENO, m.line_number, C_RESET,
-                C_DIM, C_RESET,
+                lineno_c, m.line_number, reset,
+                dim, reset,
                 rendered,
                 w = lineno_width,
             );

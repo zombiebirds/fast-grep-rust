@@ -35,6 +35,20 @@ fn is_literal(pattern: &str) -> bool {
     true
 }
 
+/// Trim a single trailing `\r` from a line slice. Files with CRLF endings
+/// keep the `\r` attached because we split on `\n`; leaving it in rendered
+/// output produces stray `^M` glyphs and breaks ANSI cursor positioning
+/// across consecutive matches in the same file (the CR returns the cursor
+/// to column 0 mid-line, then the following match's escape codes start
+/// drawing on top of the previous content).
+#[inline]
+fn strip_trailing_cr(line: &[u8]) -> &[u8] {
+    match line.split_last() {
+        Some((b'\r', rest)) => rest,
+        _ => line,
+    }
+}
+
 /// Path-component-based heuristic for "hidden". Returns true if any component
 /// of `p` *under* `root` starts with `.` (Unix dotfile convention, also used
 /// cross-platform by `.git/`, `.github/`, `.cargo/`, etc.). Mirrors what the
@@ -444,7 +458,7 @@ fn search_literal(buf: &[u8], finder: &memmem::Finder) -> Vec<(usize, String)> {
         counted_to = abs_pos;
 
         let (line_start, line_end) = line_bounds(buf, abs_pos);
-        let line = String::from_utf8_lossy(&buf[line_start..line_end]).into_owned();
+        let line = String::from_utf8_lossy(strip_trailing_cr(&buf[line_start..line_end])).into_owned();
         results.push((line_num, line));
 
         // Advance past this line to avoid duplicates
@@ -472,7 +486,7 @@ fn search_regex(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> Vec<(usize, 
                 .unwrap_or(buf.len());
             let line = &buf[pos..end];
             if re.is_match(line) {
-                results.push((line_num, String::from_utf8_lossy(line).into_owned()));
+                results.push((line_num, String::from_utf8_lossy(strip_trailing_cr(line)).into_owned()));
             }
             line_num += 1;
             pos = end + 1;
@@ -489,7 +503,7 @@ fn search_regex(buf: &[u8], re: &BytesRegex, line_by_line: bool) -> Vec<(usize, 
         counted_to = start;
         let (line_start, line_end) = line_bounds(buf, start);
         if line_start != last_line_start {
-            let line = String::from_utf8_lossy(&buf[line_start..line_end]).into_owned();
+            let line = String::from_utf8_lossy(strip_trailing_cr(&buf[line_start..line_end])).into_owned();
             results.push((line_num, line));
             last_line_start = line_start;
         }
@@ -856,7 +870,7 @@ pub fn search_persistent_timed(
                             }
                             let line_bytes = &mmap[start..end];
                             if matcher.has_match(line_bytes, needs_line_by_line(pattern)) {
-                                let line = String::from_utf8_lossy(line_bytes).into_owned();
+                                let line = String::from_utf8_lossy(strip_trailing_cr(line_bytes)).into_owned();
                                 file_matches.push(Match {
                                     path: path_buf.clone(),
                                     line_number: line_no as usize,
@@ -1243,7 +1257,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
 
                         use std::io::Write;
                         let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                        out_buf.extend_from_slice(&buf[line_start..line_end]);
+                        out_buf.extend_from_slice(strip_trailing_cr(&buf[line_start..line_end]));
                         out_buf.push(b'\n');
                         file_count += 1;
 
@@ -1268,7 +1282,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
                             if re.is_match(line_bytes) {
                                 use std::io::Write;
                                 let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                                out_buf.extend_from_slice(line_bytes);
+                                out_buf.extend_from_slice(strip_trailing_cr(line_bytes));
                                 out_buf.push(b'\n');
                                 file_count += 1;
                             }
@@ -1287,7 +1301,7 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
                             if line_start != last_line_start {
                                 use std::io::Write;
                                 let _ = write!(out_buf, "{}:{}:", path_bytes, line_num);
-                                out_buf.extend_from_slice(&buf[line_start..line_end]);
+                                out_buf.extend_from_slice(strip_trailing_cr(&buf[line_start..line_end]));
                                 out_buf.push(b'\n');
                                 file_count += 1;
                                 last_line_start = line_start;
