@@ -196,7 +196,34 @@ pub enum DaemonAction {
     },
 }
 
+/// Enable ANSI/VT escape processing on Windows consoles. Win10 build 1607+
+/// supports VT but each process must opt in via SetConsoleMode — without this,
+/// cmd.exe renders our color escapes as raw text. Best-effort: failure (older
+/// Windows, redirected stdout) leaves the console mode untouched, which falls
+/// back to the same behavior as before.
+#[cfg(windows)]
+fn enable_ansi_on_windows() {
+    use std::os::windows::io::AsRawHandle;
+    extern "system" {
+        fn GetConsoleMode(h: *mut core::ffi::c_void, m: *mut u32) -> i32;
+        fn SetConsoleMode(h: *mut core::ffi::c_void, m: u32) -> i32;
+    }
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    let h = std::io::stdout().as_raw_handle() as *mut core::ffi::c_void;
+    let mut mode = 0u32;
+    unsafe {
+        if GetConsoleMode(h, &mut mode) != 0 {
+            let _ = SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_ansi_on_windows() {}
+
 pub fn run() -> Result<()> {
+    enable_ansi_on_windows();
+
     let cli = Cli::parse();
 
     let opts = SearchOpts {
