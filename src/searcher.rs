@@ -132,7 +132,6 @@ fn extract_longest_literal(pattern: &str) -> Option<Vec<u8>> {
             }
             let mut depth = 1i32;
             let mut has_alt = false;
-            let saved = chars.clone();
             {
                 let mut scan = chars.clone();
                 while let Some(c) = scan.next() {
@@ -858,14 +857,12 @@ pub fn search_persistent_timed(
                 // Low density: line-level verify (read only candidate lines)
                 // On macOS, try Metal GPU pre-filter first for literal patterns
                 // (only when FGR_METAL=1 is set).
-                let use_metal = cfg!(target_os = "macos")
-                    && std::env::var("FGR_METAL").map(|v| v == "1").unwrap_or(false);
+                #[cfg(target_os = "macos")]
+                let use_metal = std::env::var("FGR_METAL").map(|v| v == "1").unwrap_or(false);
 
+                #[cfg(target_os = "macos")]
                 let metal_literal: Option<Vec<u8>> = if use_metal {
-                    #[cfg(target_os = "macos")]
-                    { extract_longest_literal(pattern) }
-                    #[cfg(not(target_os = "macos"))]
-                    { None }
+                    extract_longest_literal(pattern)
                 } else {
                     None
                 };
@@ -1380,7 +1377,6 @@ pub fn search_full_scan_streaming<W: std::io::Write + Send>(
 
             // Flush output buffer after each file with matches
             if !out_buf.is_empty() {
-                use std::io::Write;
                 let mut out = output.lock().unwrap();
                 let _ = out.write_all(&out_buf);
                 out_buf.clear();
