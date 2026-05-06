@@ -104,7 +104,7 @@ impl SparseIndex {
     pub fn build_from_directory(
         root: &Path,
         no_ignore: bool,
-        type_filter: Option<&str>,
+        type_filter: &[String],
         verbose: bool,
     ) -> Result<Self> {
         // Phase 1: collect all file paths
@@ -121,11 +121,8 @@ impl SparseIndex {
             }
             let path = entry.path();
 
-            if let Some(ext_filter) = type_filter {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext == ext_filter => {}
-                    _ => continue,
-                }
+            if !crate::searcher::passes_type_filter(path, type_filter) {
+                continue;
             }
 
             paths.push(path.to_path_buf());

@@ -24,6 +24,8 @@ fn render_opts(heading: bool, color: bool, pattern: &str) -> RenderOpts {
     RenderOpts {
         heading,
         color,
+        invert: false,
+        only_matching: false,
         pattern: Some(pattern.to_string()),
     }
 }
@@ -41,7 +43,7 @@ fn write_files(tmp: &Path, files: &[(&str, &str)]) {
 /// Build a persistent index inside the temp dir at `.fgr-test`.
 fn build_test_index(tmp: &Path) -> fast_grep::persist::PersistentIndex {
     let idx_dir = tmp.join(".fgr-test");
-    build_index(tmp, &idx_dir, true, None, false).expect("build index");
+    build_index(tmp, &idx_dir, true, &[], false).expect("build index");
     load_index(&idx_dir).expect("load index")
 }
 
@@ -58,7 +60,9 @@ fn full_scan_zero_context_one_file() {
         "beta",
         true,  // no_ignore
         false, // hidden
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts::default(),
         &render_opts(false, false, "beta"),
         Dispatch::Streaming,
@@ -83,7 +87,9 @@ fn full_scan_with_context_emits_separator_between_distant_chunks() {
         "M",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts {
             before: 1,
             after: 1,
@@ -120,7 +126,9 @@ fn full_scan_sorted_dispatch_orders_files() {
         "MATCH",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts::default(),
         &render_opts(false, false, "MATCH"),
         Dispatch::Sorted,
@@ -150,7 +158,9 @@ fn heading_mode_emits_path_once_per_file() {
         "hit",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts::default(),
         &render_opts(true, false, "hit"),
         Dispatch::Sorted,
@@ -179,7 +189,9 @@ fn heading_mode_with_context_uses_dash_for_context() {
         "M",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts {
             before: 1,
             after: 1,
@@ -221,7 +233,9 @@ fn indexed_search_with_context_matches_full_scan() {
         "MATCH",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ctx,
         &opts,
         Dispatch::Sorted,
@@ -236,6 +250,9 @@ fn indexed_search_with_context_matches_full_scan() {
         "MATCH",
         None,
         false,
+        &[],
+        &[],
+        &[],
         &ctx,
         &opts,
         Dispatch::Sorted,
@@ -259,7 +276,9 @@ fn match_at_line_one_clamps_before_context() {
         "MATCH",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts {
             before: 5,
             after: 0,
@@ -292,7 +311,9 @@ fn match_at_eof_without_trailing_newline_clamps_after_context() {
         "MATCH",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts {
             before: 0,
             after: 5,
@@ -328,7 +349,9 @@ fn no_separator_between_files() {
         "M",
         true,
         false,
-        None,
+        &[],
+        &[],
+        &[],
         &ContextOpts {
             before: 2,
             after: 2,
