@@ -237,7 +237,9 @@ pub fn search_full_scan_render<W: Write + Send>(
     pattern: &str,
     no_ignore: bool,
     hidden: bool,
-    type_filter: Option<&str>,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
     ctx: &ContextOpts,
     render: &RenderOpts,
     dispatch: Dispatch,
@@ -247,19 +249,22 @@ pub fn search_full_scan_render<W: Write + Send>(
     let total_count = std::sync::atomic::AtomicUsize::new(0);
     let collector: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
 
-    let walker = ignore::WalkBuilder::new(root)
-        .git_ignore(!no_ignore)
+    let mut wb = ignore::WalkBuilder::new(root);
+    wb.git_ignore(!no_ignore)
         .hidden(!hidden)
-        .threads(num_cpus())
-        .build_parallel();
+        .threads(num_cpus());
+    if let Some(ov) = crate::searcher::build_overrides(root, include, exclude)? {
+        wb.overrides(ov);
+    }
+    let walker = wb.build_parallel();
 
-    let type_filter_owned = type_filter.map(|s| s.to_string());
+    let type_filter_owned: Vec<String> = type_filter.to_vec();
 
     walker.run(|| {
         let matcher = &matcher;
         let total_count = &total_count;
         let collector = &collector;
-        let type_filter = type_filter_owned.as_deref();
+        let type_filter = type_filter_owned.as_slice();
         let mut bufs = WorkerBufs::new();
 
         Box::new(move |entry| {
@@ -272,11 +277,8 @@ pub fn search_full_scan_render<W: Write + Send>(
             }
             let path = entry.path();
 
-            if let Some(ext_filter) = type_filter {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext == ext_filter => {}
-                    _ => return ignore::WalkState::Continue,
-                }
+            if !crate::searcher::passes_type_filter(path, type_filter) {
+                return ignore::WalkState::Continue;
             }
 
             let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -329,6 +331,9 @@ pub fn search_persistent_render<W: Write + Send>(
     pattern: &str,
     path_filter: Option<&Path>,
     hidden: bool,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
     ctx: &ContextOpts,
     render: &RenderOpts,
     dispatch: Dispatch,
@@ -338,6 +343,7 @@ pub fn search_persistent_render<W: Write + Send>(
 
     let matcher = Matcher::new(pattern)?;
     let index_root = PathBuf::from(&index.meta.root_dir);
+    let ov = crate::searcher::build_overrides(&index_root, include, exclude)?;
     let (result, mut timing) = index.search_timed(pattern);
     let t_verify = std::time::Instant::now();
 
@@ -352,13 +358,16 @@ pub fn search_persistent_render<W: Write + Send>(
         SearchResult::BitmapFiles(paths) | SearchResult::AllFiles(paths) => paths,
     };
 
-    // Apply hidden + path filter (same logic as before — see is_hidden_path
-    // doc for why the index-root prefix is stripped before checking).
+    // Apply hidden + path filter + glob overrides + type filter. Same
+    // post-lookup filtering pattern; the indexed path can't push these
+    // down into the trigram lookup so we do them in one pass after.
     let candidate_paths: Vec<PathBuf> = candidate_paths
         .into_iter()
         .filter(|p| {
             (hidden || !crate::searcher::is_hidden_path(p, &index_root))
                 && path_filter.map_or(true, |f| p.starts_with(f))
+                && crate::searcher::passes_overrides(p, ov.as_ref())
+                && crate::searcher::passes_type_filter(p, type_filter)
         })
         .map(|p| p.to_path_buf())
         .collect();
@@ -416,6 +425,8 @@ mod render_tests {
         RenderOpts {
             heading,
             color: false,
+            invert: false,
+            only_matching: false,
             pattern: None,
         }
     }
@@ -737,9 +748,22 @@ pub struct RenderOpts {
     /// substring. Strictly TTY-driven at the call site — independent of
     /// `heading` so `fgr --heading | cat` doesn't leak escapes.
     pub color: bool,
+    /// `-v` / `--invert-match`: emit non-matching lines instead of matches.
+    /// When true, the chunk-merging context machinery is bypassed (every
+    /// non-matching line stands alone — `-A`/`-B`/`-C` don't compose with
+    /// invert in any meaningful way at the line level), and the path
+    /// delimiter stays `:` because the emitted lines are still "what the
+    /// user asked for", just inverted.
+    pub invert: bool,
+    /// `-o` / `--only-matching`: when true, match lines emit one output
+    /// entry per regex `find_iter` substring instead of one per matching
+    /// line. The substring replaces the line content in the output. No
+    /// effect on context lines or non-match output.
+    pub only_matching: bool,
     /// Effective regex pattern (with `(?i)` prefix etc. already applied)
-    /// used for highlighting matched substrings inside match lines. The
-    /// renderer compiles it once per file. `None` skips highlighting.
+    /// used for highlighting matched substrings inside match lines, and —
+    /// when `only_matching` is on — for enumerating substring positions.
+    /// The renderer compiles it once per file. `None` skips highlighting.
     pub pattern: Option<String>,
 }
 
@@ -772,10 +796,15 @@ pub(crate) fn render_file_into(
 
     let lbl = needs_line_by_line(pattern);
 
-    // Highlighting is only meaningful when colour is on. We use the bytes
-    // regex here so we never leave the byte domain — the line content
-    // never gets UTF-8 validated for the sake of rendering.
-    let hl_re: Option<regex::bytes::Regex> = if render.color {
+    // We need a compiled regex on this file for two distinct reasons:
+    //   1. colour highlighting wraps each match position in ANSI codes
+    //      inside the line content;
+    //   2. `--only-matching` enumerates match positions to emit one entry
+    //      per substring instead of one per matching line.
+    // Compile once and bind to two names so each consumer asks the right
+    // question — passing the same Option to both would make `-o` without
+    // colour incorrectly inline ANSI codes around the extracted substring.
+    let bytes_re: Option<regex::bytes::Regex> = if render.color || render.only_matching {
         render
             .pattern
             .as_deref()
@@ -783,8 +812,56 @@ pub(crate) fn render_file_into(
     } else {
         None
     };
+    // Only the highlighter sees a regex when colour is actually on.
+    let hl_re: Option<&regex::bytes::Regex> = if render.color {
+        bytes_re.as_ref()
+    } else {
+        None
+    };
 
     let path_str = path.to_string_lossy();
+
+    // --- --invert-match ---
+    //
+    // Inverted output is line-by-line and ignores the chunk/context
+    // machinery entirely: every non-matching line stands alone. `-A`/
+    // `-B`/`-C` don't compose with `-v` in any natural way at the
+    // single-line grain (you'd have to define context relative to which
+    // lines? all matches? all non-matches?), so we mirror grep/ripgrep
+    // and just emit the raw filtered lines. `-o` is also a no-op here:
+    // by definition there are no match substrings to extract from a
+    // non-matching line.
+    if render.invert {
+        let mut header_emitted = false;
+        let mut match_count: usize = 0;
+        let mut line_no: u32 = 0;
+        let mut pos: usize = 0;
+        while pos < mmap.len() {
+            let end = memchr::memchr(b'\n', &mmap[pos..])
+                .map(|p| pos + p)
+                .unwrap_or(mmap.len());
+            line_no += 1;
+            let line_bytes = &mmap[pos..end];
+            if !matcher.has_match(line_bytes, lbl) {
+                if !header_emitted && render.heading {
+                    emit_heading(out_buf, &path_str, render);
+                    header_emitted = true;
+                }
+                emit_line(
+                    out_buf,
+                    &path_str,
+                    line_no,
+                    strip_trailing_cr(line_bytes),
+                    LineKind::Match,
+                    render,
+                    None,
+                );
+                match_count += 1;
+            }
+            pos = end + 1;
+        }
+        return match_count;
+    }
 
     // State machine for chunk merging:
     //   prev_lines    — ring buffer of last `before` non-match lines, used
@@ -862,22 +939,60 @@ pub(crate) fn render_file_into(
                     bytes,
                     LineKind::Context,
                     render,
-                    hl_re.as_ref(),
+                    hl_re,
                 );
             }
             prev_lines.clear();
 
-            emit_line(
-                out_buf,
-                &path_str,
-                line_no,
-                display_bytes,
-                LineKind::Match,
-                render,
-                hl_re.as_ref(),
-            );
+            // `--only-matching` splits a match line into one output entry
+            // per regex find_iter substring. Same line number repeats
+            // across substrings, mirroring grep/ripgrep. Falls back to
+            // whole-line emission if the regex didn't compile (defensive
+            // — the matcher already validated `pattern`, so we don't
+            // expect None here in practice).
+            if render.only_matching {
+                if let Some(ref re) = bytes_re {
+                    for m in re.find_iter(display_bytes) {
+                        emit_line(
+                            out_buf,
+                            &path_str,
+                            line_no,
+                            &display_bytes[m.start()..m.end()],
+                            LineKind::Match,
+                            render,
+                            hl_re,
+                        );
+                        // `-o` reports per substring, not per matching line:
+                        // `Searched in Xms, N matches` should equal what the
+                        // user sees on stdout. (`--count` counts lines and
+                        // takes a different path entirely, so it's unaffected.)
+                        match_count += 1;
+                    }
+                } else {
+                    emit_line(
+                        out_buf,
+                        &path_str,
+                        line_no,
+                        display_bytes,
+                        LineKind::Match,
+                        render,
+                        hl_re,
+                    );
+                    match_count += 1;
+                }
+            } else {
+                emit_line(
+                    out_buf,
+                    &path_str,
+                    line_no,
+                    display_bytes,
+                    LineKind::Match,
+                    render,
+                    hl_re,
+                );
+                match_count += 1;
+            }
             last_emitted_line = Some(line_no);
-            match_count += 1;
             after_remaining = ctx.after;
         } else if after_remaining > 0 {
             emit_line(
@@ -887,7 +1002,7 @@ pub(crate) fn render_file_into(
                 display_bytes,
                 LineKind::Context,
                 render,
-                hl_re.as_ref(),
+                hl_re,
             );
             last_emitted_line = Some(line_no);
             after_remaining -= 1;

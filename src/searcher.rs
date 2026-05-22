@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use aho_corasick::AhoCorasick;
 use anyhow::Result;
+use ignore::overrides::{Override, OverrideBuilder};
 use memchr::memmem;
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -13,6 +14,59 @@ use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use crate::metal::metal_impl::global_verifier;
 use crate::persist::SearchResult;
+
+/// Build an `ignore::overrides::Override` from include/exclude glob lists.
+/// The `ignore` crate uses the `!` prefix to negate a glob (i.e. exclude);
+/// we translate `--include`/`--exclude` into that shape so a `WalkBuilder`
+/// can do filtering during the parallel walk, and `passes_overrides` can
+/// apply the same predicate per-path on the indexed search path.
+///
+/// Multiple includes are OR'd (a file is in if it matches any), same for
+/// excludes. Returns `Ok(None)` when both lists are empty so callers can
+/// skip the WalkBuilder configuration step entirely.
+pub(crate) fn build_overrides(
+    root: &Path,
+    includes: &[String],
+    excludes: &[String],
+) -> Result<Option<Override>> {
+    if includes.is_empty() && excludes.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = OverrideBuilder::new(root);
+    for pat in includes {
+        builder.add(pat)?;
+    }
+    for pat in excludes {
+        builder.add(&format!("!{}", pat))?;
+    }
+    Ok(Some(builder.build()?))
+}
+
+/// Apply `--include` / `--exclude` globs to a single candidate path.
+/// Used by the indexed search path where we already have the candidate
+/// list and just need to filter it post-lookup. Equivalent to checking
+/// `Override::matched(path).is_ignore()`.
+pub(crate) fn passes_overrides(path: &Path, ov: Option<&Override>) -> bool {
+    let ov = match ov {
+        Some(o) => o,
+        None => return true,
+    };
+    !ov.matched(path, false).is_ignore()
+}
+
+/// Apply `--type EXT` (potentially repeated) to a single candidate path.
+/// The list is OR'd: a file passes if its extension matches any entry.
+/// An empty list short-circuits to true so callers can thread the flag
+/// through unconditionally.
+pub(crate) fn passes_type_filter(path: &Path, type_filters: &[String]) -> bool {
+    if type_filters.is_empty() {
+        return true;
+    }
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => type_filters.iter().any(|t| t == ext),
+        None => false,
+    }
+}
 
 /// Match record for the legacy aggregate-mode APIs (`search_full_scan` and
 /// `search_persistent_timed`). The render pipeline writes formatted bytes
@@ -416,6 +470,48 @@ impl Matcher {
         }
     }
 
+    /// Inverse of `search_buffer`: collect lines that **do not** match the
+    /// pattern. Used when `--invert-match` (`-v`) is on. The pre-filter
+    /// optimisations (memmem, Aho-Corasick) don't help here — we have to
+    /// look at every line — so this is plain per-line iteration that
+    /// delegates to `has_match` for the predicate.
+    #[inline]
+    fn scan_non_match_lines(&self, buf: &[u8], lbl: bool) -> Vec<(usize, String)> {
+        let mut results = Vec::new();
+        let mut line_no: usize = 0;
+        let mut pos = 0;
+        while pos < buf.len() {
+            let end = memchr::memchr(b'\n', &buf[pos..])
+                .map(|p| pos + p)
+                .unwrap_or(buf.len());
+            line_no += 1;
+            let line = &buf[pos..end];
+            if !self.has_match(line, lbl) {
+                results.push((line_no, String::from_utf8_lossy(line).into_owned()));
+            }
+            pos = end + 1;
+        }
+        results
+    }
+
+    /// Inverse of `count_lines`: count lines that **do not** match. Same
+    /// shape as `scan_non_match_lines` but skips the String allocation.
+    #[inline]
+    fn count_non_match_lines(&self, buf: &[u8], lbl: bool) -> usize {
+        let mut count = 0;
+        let mut pos = 0;
+        while pos < buf.len() {
+            let end = memchr::memchr(b'\n', &buf[pos..])
+                .map(|p| pos + p)
+                .unwrap_or(buf.len());
+            if !self.has_match(&buf[pos..end], lbl) {
+                count += 1;
+            }
+            pos = end + 1;
+        }
+        count
+    }
+
     /// Count matching lines without allocating Strings.
     #[inline]
     fn count_lines(&self, buf: &[u8], lbl: bool) -> usize {
@@ -652,10 +748,14 @@ pub fn search_persistent_count(
     pattern: &str,
     path_filter: Option<&Path>,
     hidden: bool,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
 ) -> Result<(usize, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
     let index_root = PathBuf::from(&index.meta.root_dir);
+    let ov = build_overrides(&index_root, include, exclude)?;
     let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
@@ -676,6 +776,12 @@ pub fn search_persistent_count(
                     if !hit.path.starts_with(filter) {
                         continue;
                     }
+                }
+                if !passes_overrides(hit.path, ov.as_ref()) {
+                    continue;
+                }
+                if !passes_type_filter(hit.path, type_filter) {
+                    continue;
                 }
                 by_file.entry(hit.path).or_default().push(hit.byte_offset);
             }
@@ -730,6 +836,8 @@ pub fn search_persistent_count(
                 .filter(|p| {
                     (hidden || !is_hidden_path(p, &index_root))
                         && path_filter.map_or(true, |f| p.starts_with(f))
+                        && passes_overrides(p, ov.as_ref())
+                        && passes_type_filter(p, type_filter)
                 })
                 .collect();
             count_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
@@ -740,6 +848,8 @@ pub fn search_persistent_count(
                 .filter(|p| {
                     (hidden || !is_hidden_path(p, &index_root))
                         && path_filter.map_or(true, |f| p.starts_with(f))
+                        && passes_overrides(p, ov.as_ref())
+                        && passes_type_filter(p, type_filter)
                 })
                 .collect();
             count_file_level(
@@ -802,10 +912,14 @@ pub fn search_persistent_timed(
     pattern: &str,
     path_filter: Option<&Path>,
     hidden: bool,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
 ) -> Result<(Vec<Match>, crate::persist::SearchTiming)> {
     let matcher = Matcher::new(pattern)?;
     let lbl = needs_line_by_line(pattern);
     let index_root = PathBuf::from(&index.meta.root_dir);
+    let ov = build_overrides(&index_root, include, exclude)?;
     let (result, mut timing) = index.search_timed(pattern);
 
     let t_verify = std::time::Instant::now();
@@ -862,6 +976,12 @@ pub fn search_persistent_timed(
                     if !hit.path.starts_with(filter) {
                         continue;
                     }
+                }
+                if !passes_overrides(hit.path, ov.as_ref()) {
+                    continue;
+                }
+                if !passes_type_filter(hit.path, type_filter) {
+                    continue;
                 }
                 by_file
                     .entry(hit.path)
@@ -1002,6 +1122,8 @@ pub fn search_persistent_timed(
                 .filter(|p| {
                     (hidden || !is_hidden_path(p, &index_root))
                         && path_filter.map_or(true, |f| p.starts_with(f))
+                        && passes_overrides(p, ov.as_ref())
+                        && passes_type_filter(p, type_filter)
                 })
                 .collect();
             verify_file_level(&matcher, &filtered, &mut timing, "bitmap-only", lbl)
@@ -1012,6 +1134,8 @@ pub fn search_persistent_timed(
                 .filter(|p| {
                     (hidden || !is_hidden_path(p, &index_root))
                         && path_filter.map_or(true, |f| p.starts_with(f))
+                        && passes_overrides(p, ov.as_ref())
+                        && passes_type_filter(p, type_filter)
                 })
                 .collect();
             verify_file_level(
@@ -1078,23 +1202,29 @@ pub fn search_full_scan(
     pattern: &str,
     no_ignore: bool,
     hidden: bool,
-    type_filter: Option<&str>,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
+    invert: bool,
 ) -> Result<Vec<Match>> {
     let matcher = Matcher::new(pattern)?;
     let collector: Mutex<Vec<Vec<Match>>> = Mutex::new(Vec::new());
 
-    let walker = ignore::WalkBuilder::new(root)
-        .git_ignore(!no_ignore)
+    let mut wb = ignore::WalkBuilder::new(root);
+    wb.git_ignore(!no_ignore)
         .hidden(!hidden)
-        .threads(num_cpus())
-        .build_parallel();
+        .threads(num_cpus());
+    if let Some(ov) = build_overrides(root, include, exclude)? {
+        wb.overrides(ov);
+    }
+    let walker = wb.build_parallel();
 
-    let type_filter_owned = type_filter.map(|s| s.to_string());
+    let type_filter_owned: Vec<String> = type_filter.to_vec();
 
     walker.run(|| {
         let matcher = &matcher;
         let collector = &collector;
-        let type_filter = type_filter_owned.as_deref();
+        let type_filter = type_filter_owned.as_slice();
         let mut local_results: Vec<Match> = Vec::with_capacity(256);
         // Thread-local read buffer — reused across files
         let mut read_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -1111,11 +1241,8 @@ pub fn search_full_scan(
 
             let path = entry.path();
 
-            if let Some(ext_filter) = type_filter {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext == ext_filter => {}
-                    _ => return ignore::WalkState::Continue,
-                }
+            if !passes_type_filter(path, type_filter) {
+                return ignore::WalkState::Continue;
             }
 
             // Use metadata from the walk entry (already stat'd, no extra syscall)
@@ -1152,7 +1279,12 @@ pub fn search_full_scan(
                 return ignore::WalkState::Continue;
             }
 
-            let hits = matcher.search_buffer(buf, needs_line_by_line(pattern));
+            let lbl = needs_line_by_line(pattern);
+            let hits = if invert {
+                matcher.scan_non_match_lines(buf, lbl)
+            } else {
+                matcher.search_buffer(buf, lbl)
+            };
             if !hits.is_empty() {
                 let path_buf = path.to_path_buf();
                 for (ln, line) in hits {
@@ -1189,23 +1321,29 @@ pub fn search_full_scan_count(
     pattern: &str,
     no_ignore: bool,
     hidden: bool,
-    type_filter: Option<&str>,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
+    invert: bool,
 ) -> Result<usize> {
     let matcher = Matcher::new(pattern)?;
     let total_count = std::sync::atomic::AtomicUsize::new(0);
 
-    let walker = ignore::WalkBuilder::new(root)
-        .git_ignore(!no_ignore)
+    let mut wb = ignore::WalkBuilder::new(root);
+    wb.git_ignore(!no_ignore)
         .hidden(!hidden)
-        .threads(num_cpus())
-        .build_parallel();
+        .threads(num_cpus());
+    if let Some(ov) = build_overrides(root, include, exclude)? {
+        wb.overrides(ov);
+    }
+    let walker = wb.build_parallel();
 
-    let type_filter_owned = type_filter.map(|s| s.to_string());
+    let type_filter_owned: Vec<String> = type_filter.to_vec();
 
     walker.run(|| {
         let matcher = &matcher;
         let total_count = &total_count;
-        let type_filter = type_filter_owned.as_deref();
+        let type_filter = type_filter_owned.as_slice();
         let mut read_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
         Box::new(move |entry| {
@@ -1220,11 +1358,8 @@ pub fn search_full_scan_count(
 
             let path = entry.path();
 
-            if let Some(ext_filter) = type_filter {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext == ext_filter => {}
-                    _ => return ignore::WalkState::Continue,
-                }
+            if !passes_type_filter(path, type_filter) {
+                return ignore::WalkState::Continue;
             }
 
             read_buf.clear();
@@ -1258,7 +1393,12 @@ pub fn search_full_scan_count(
                 return ignore::WalkState::Continue;
             }
 
-            let count = matcher.count_lines(buf, needs_line_by_line(pattern));
+            let lbl = needs_line_by_line(pattern);
+            let count = if invert {
+                matcher.count_non_match_lines(buf, lbl)
+            } else {
+                matcher.count_lines(buf, lbl)
+            };
             if count > 0 {
                 total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
             }

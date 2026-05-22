@@ -721,7 +721,7 @@ pub fn build(
     root: &Path,
     output: &Path,
     no_ignore: bool,
-    type_filter: Option<&str>,
+    type_filter: &[String],
     verbose: bool,
 ) -> Result<()> {
     if verbose {

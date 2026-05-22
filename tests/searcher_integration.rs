@@ -74,12 +74,12 @@ fn setup_test_dir() -> tempfile::TempDir {
 /// collide with anything the search results might match.
 fn build_test_index(tmp: &Path) -> PersistentIndex {
     let idx_dir = tmp.join(".fgr-test");
-    build_index(tmp, &idx_dir, true, None, false).expect("build persistent index");
+    build_index(tmp, &idx_dir, true, &[], false).expect("build persistent index");
     load_index(&idx_dir).expect("load persistent index")
 }
 
 fn search(index: &PersistentIndex, pattern: &str) -> Vec<Match> {
-    search_persistent_timed(index, pattern, None, false)
+    search_persistent_timed(index, pattern, None, false, &[], &[], &[])
         .expect("search")
         .0
 }
@@ -154,17 +154,18 @@ fn indexed_search_matches_full_scan() {
             .collect();
         indexed.sort();
 
-        let mut full: Vec<String> = search_full_scan(tmp.path(), pattern, true, false, None)
-            .unwrap()
-            .iter()
-            .map(|m| {
-                format!(
-                    "{}:{}",
-                    m.path.strip_prefix(tmp.path()).unwrap().display(),
-                    m.line_number
-                )
-            })
-            .collect();
+        let mut full: Vec<String> =
+            search_full_scan(tmp.path(), pattern, true, false, &[], &[], &[], false)
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{}:{}",
+                        m.path.strip_prefix(tmp.path()).unwrap().display(),
+                        m.line_number
+                    )
+                })
+                .collect();
         full.sort();
 
         assert_eq!(

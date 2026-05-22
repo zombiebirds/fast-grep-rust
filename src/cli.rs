@@ -16,7 +16,23 @@ struct SearchOpts {
     quiet: bool,
     no_ignore: bool,
     hidden: bool,
-    file_type: Option<String>,
+    /// `-v` / `--invert-match`: emit lines that do NOT match. Forces the
+    /// CLI to route through the direct-scan path even when --index is
+    /// set, since the trigram index can only locate matches.
+    invert: bool,
+    /// `-o` / `--only-matching`: emit one output entry per regex-match
+    /// substring rather than per matching line. Doesn't affect --count
+    /// (still per-file line counts) or --files-with-matches.
+    only_matching: bool,
+    /// Allowed file extensions. Empty list = no filter. Repeated flags
+    /// accumulate so `--type rs --type ts` matches both.
+    file_type: Vec<String>,
+    /// Glob patterns; a file is searched if it matches any include glob.
+    /// Empty list = no positive filter.
+    include: Vec<String>,
+    /// Glob patterns; a file is excluded if it matches any exclude glob.
+    /// Empty list = no negative filter.
+    exclude: Vec<String>,
     /// Force the grouped (heading) output format on/off. None = follow TTY.
     heading_override: Option<bool>,
     /// Resolved before/after context window for `-A` / `-B` / `-C`.
@@ -103,13 +119,15 @@ pub struct Cli {
     #[arg(short = 'E', long = "extended-regexp", global = true)]
     pub extended_regexp: bool,
 
-    /// Include only files matching GLOB
+    /// Include only files matching GLOB. May be specified multiple times;
+    /// the union of all globs is included.
     #[arg(long = "include", value_name = "GLOB", global = true)]
-    pub include: Option<String>,
+    pub include: Vec<String>,
 
-    /// Exclude files matching GLOB
+    /// Exclude files matching GLOB. May be specified multiple times; a file
+    /// is excluded if it matches any of the globs.
     #[arg(long = "exclude", value_name = "GLOB", global = true)]
-    pub exclude: Option<String>,
+    pub exclude: Vec<String>,
 
     // -- fast-grep specific flags --
     /// Use persistent index for searching (path to .fgr dir)
@@ -142,9 +160,11 @@ pub struct Cli {
     #[arg(short = 'U', long = "no-unicode", global = true)]
     pub no_unicode: bool,
 
-    /// Filter by file extension (e.g., --type rs)
+    /// Filter by file extension (e.g., --type rs). May be specified
+    /// multiple times; a file is searched if its extension matches any
+    /// of the listed types.
     #[arg(long = "type", value_name = "EXT", global = true)]
-    pub file_type: Option<String>,
+    pub file_type: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -258,14 +278,18 @@ pub fn run() -> Result<()> {
         quiet: cli.quiet,
         no_ignore: cli.no_ignore,
         hidden: cli.hidden,
+        invert: cli.invert_match,
+        only_matching: cli.only_matching,
         file_type: cli.file_type.clone(),
+        include: cli.include.clone(),
+        exclude: cli.exclude.clone(),
         heading_override,
         context,
         pattern: None, // populated below once the effective pattern is built
     };
 
     if let Some(cmd) = cli.command {
-        return run_subcommand(cmd, opts.no_ignore, opts.hidden, opts.file_type.as_deref());
+        return run_subcommand(cmd, opts.no_ignore, opts.hidden, &opts.file_type);
     }
 
     let pattern = match cli.pattern.as_ref() {
@@ -302,11 +326,13 @@ pub fn run() -> Result<()> {
     let mut opts = opts;
     opts.pattern = Some(effective.clone());
 
-    // Case-insensitive search can't use the index reliably — the index stores
-    // trigrams from the original (case-sensitive) text, so (?i) patterns miss
-    // uppercase variants. Fall back to full scan when -i is active.
+    // Case-insensitive search and invert-match can't use the index
+    // reliably — the trigram index locates *matches* (case-sensitive
+    // ones at that), so neither pattern can be answered correctly from
+    // it. Both flags route through the direct-scan path even when
+    // --index is set.
     if let Some(ref idx_path) = cli.index_path {
-        if cli.ignore_case {
+        if cli.ignore_case || cli.invert_match {
             run_direct_search(&effective, &dir, &opts)?;
         } else {
             run_indexed_search(&effective, idx_path, dir.as_path(), &opts)?;
@@ -345,7 +371,10 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
             pattern,
             opts.no_ignore,
             opts.hidden,
-            opts.file_type.as_deref(),
+            &opts.file_type,
+            &opts.include,
+            &opts.exclude,
+            opts.invert,
         )?;
         let elapsed = start.elapsed();
         output_summary(&matches, opts)?;
@@ -373,7 +402,9 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         pattern,
         opts.no_ignore,
         opts.hidden,
-        opts.file_type.as_deref(),
+        &opts.file_type,
+        &opts.include,
+        &opts.exclude,
         &opts.context,
         &render_opts,
         dispatch,
@@ -408,13 +439,7 @@ fn run_indexed_search(
             idx_path.display()
         );
         let build_start = Instant::now();
-        persist::build(
-            search_path,
-            idx_path,
-            opts.no_ignore,
-            opts.file_type.as_deref(),
-            true,
-        )?;
+        persist::build(search_path, idx_path, opts.no_ignore, &opts.file_type, true)?;
         eprintln!("Index built in {:.2}s", build_start.elapsed().as_secs_f64());
     }
 
@@ -444,8 +469,15 @@ fn run_indexed_search(
     let start = Instant::now();
 
     if opts.count {
-        let (n, _) =
-            searcher::search_persistent_count(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
+        let (n, _) = searcher::search_persistent_count(
+            &idx,
+            pattern,
+            path_filter.as_deref(),
+            opts.hidden,
+            &opts.file_type,
+            &opts.include,
+            &opts.exclude,
+        )?;
         let search_time = start.elapsed();
         println!("{}", n);
         if !opts.quiet {
@@ -460,8 +492,15 @@ fn run_indexed_search(
 
     if opts.files_only || opts.quiet {
         // Same as direct: bypass render pipeline for these aggregate modes.
-        let (matches, _) =
-            searcher::search_persistent_timed(&idx, pattern, path_filter.as_deref(), opts.hidden)?;
+        let (matches, _) = searcher::search_persistent_timed(
+            &idx,
+            pattern,
+            path_filter.as_deref(),
+            opts.hidden,
+            &opts.file_type,
+            &opts.include,
+            &opts.exclude,
+        )?;
         output_summary(&matches, opts)?;
         let search_time = start.elapsed();
         if !opts.quiet {
@@ -488,6 +527,9 @@ fn run_indexed_search(
         pattern,
         path_filter.as_deref(),
         opts.hidden,
+        &opts.file_type,
+        &opts.include,
+        &opts.exclude,
         &opts.context,
         &render_opts,
         dispatch,
@@ -516,6 +558,8 @@ fn render_opts_for(opts: &SearchOpts) -> RenderOpts {
     RenderOpts {
         heading: use_heading(opts),
         color: use_color(),
+        invert: opts.invert,
+        only_matching: opts.only_matching,
         pattern: opts.pattern.clone(),
     }
 }
@@ -586,7 +630,7 @@ fn run_subcommand(
     cmd: Commands,
     no_ignore: bool,
     hidden: bool,
-    type_filter: Option<&str>,
+    type_filter: &[String],
 ) -> Result<()> {
     match cmd {
         Commands::Index {
@@ -709,14 +753,24 @@ fn run_bench(
     dir: &std::path::Path,
     no_ignore: bool,
     hidden: bool,
-    type_filter: Option<&str>,
+    type_filter: &[String],
 ) -> Result<()> {
     println!("Benchmarking pattern '{}' in {:?}", pattern, dir);
     println!("{}", "=".repeat(70));
 
     let start = Instant::now();
-    let full_scan_count =
-        searcher::search_full_scan_count(dir, pattern, no_ignore, hidden, type_filter)?;
+    // Bench is a built-in self-comparison; include/exclude/invert are
+    // search-time options that don't apply here.
+    let full_scan_count = searcher::search_full_scan_count(
+        dir,
+        pattern,
+        no_ignore,
+        hidden,
+        type_filter,
+        &[],
+        &[],
+        false,
+    )?;
     let full_scan_time = start.elapsed();
 
     let tmp_dir = std::env::temp_dir().join("fgr_bench_index");
@@ -731,7 +785,7 @@ fn run_bench(
 
     let start = Instant::now();
     let (persist_matches, timing) =
-        searcher::search_persistent_timed(&pidx, pattern, None, hidden)?;
+        searcher::search_persistent_timed(&pidx, pattern, None, hidden, &[], &[], &[])?;
     let persist_search_time = start.elapsed();
 
     // Get rg match count for correctness comparison
