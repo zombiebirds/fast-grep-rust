@@ -1,9 +1,9 @@
-pub mod index;
-pub mod persist;
-pub mod searcher;
-pub mod sparse;
-pub mod trigram;
 #[cfg(feature = "daemon")]
 pub mod daemon;
+pub mod index;
 #[cfg(target_os = "macos")]
 pub mod metal;
+pub mod persist;
+pub mod render;
+pub mod searcher;
+pub mod trigram;
