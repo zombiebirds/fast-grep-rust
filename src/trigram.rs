@@ -1,15 +1,39 @@
-use std::collections::HashSet;
-
-pub fn extract_trigrams(text: &str) -> HashSet<[u8; 3]> {
-    let bytes = text.as_bytes();
-    let mut set = HashSet::new();
-    if bytes.len() < 3 {
-        return set;
+/// Returns true if `pattern` enables case-insensitive matching anywhere
+/// via an inline `(?i…)` flag group. The trigram index is built from the
+/// raw bytes of source files (case-sensitive), so a `(?i)abc` pattern
+/// can match `ABC` in a file even though the trigram `abc` was never
+/// recorded — the index would falsely report no candidates. Callers use
+/// this as a short-circuit signal to fall back to a full-file scan.
+///
+/// Walks `(?…)` flag groups looking for `i` not preceded by `-` (the
+/// `-i` form disables the flag rather than enabling it). Catches
+/// `(?i)`, `(?im)`, `(?mi)`, `(?Ri)`, `(?i:…)`, etc. False positives
+/// (treating `(?-i)abc` as case-insensitive) are harmless — we just
+/// pay the full-scan cost unnecessarily.
+pub fn has_case_insensitive_flag(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'(' && bytes[i + 1] == b'?' {
+            // Walk the flag-group prefix until `:` (scoped flags) or `)`
+            // (top-level flags), checking each char.
+            let mut j = i + 2;
+            let mut negate = false;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'-' => negate = true,
+                    b'i' if !negate => return true,
+                    b':' | b')' => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
     }
-    for w in bytes.windows(3) {
-        set.insert([w[0], w[1], w[2]]);
-    }
-    set
+    false
 }
 
 /// Decompose a regex pattern into literal trigrams that must appear in any match.
@@ -35,30 +59,6 @@ pub fn decompose_pattern(pattern: &str) -> Vec<Vec<[u8; 3]>> {
         result.push(trigrams);
     }
     // Filter out empty alternatives (they match everything)
-    if result.iter().any(|v| v.is_empty()) {
-        return vec![vec![]];
-    }
-    result
-}
-
-/// Like decompose_pattern but preserves trigram order (no sort/dedup).
-/// Used for adjacency filtering with position masks.
-pub fn decompose_pattern_ordered(pattern: &str) -> Vec<Vec<[u8; 3]>> {
-    let alternatives = split_alternatives(pattern);
-    let mut result = Vec::new();
-    for alt in &alternatives {
-        let literals = extract_literal_runs(alt);
-        let mut trigrams = Vec::new();
-        for lit in &literals {
-            let bytes = lit.as_bytes();
-            if bytes.len() >= 3 {
-                for w in bytes.windows(3) {
-                    trigrams.push([w[0], w[1], w[2]]);
-                }
-            }
-        }
-        result.push(trigrams);
-    }
     if result.iter().any(|v| v.is_empty()) {
         return vec![vec![]];
     }
@@ -127,8 +127,7 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
             // Escaped character — check if it's a literal
             if let Some(&next) = chars.peek() {
                 match next {
-                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z'
-                    | 'p' | 'P' => {
+                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | 'B' | 'A' | 'z' | 'Z' | 'p' | 'P' => {
                         // Not a literal — regex escape class
                         if !current.is_empty() {
                             runs.push(std::mem::take(&mut current));
@@ -138,7 +137,9 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                         if (next == 'p' || next == 'P') && chars.peek() == Some(&'{') {
                             chars.next(); // skip '{'
                             while let Some(c) = chars.next() {
-                                if c == '}' { break; }
+                                if c == '}' {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -188,7 +189,9 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                 runs.push(std::mem::take(&mut current));
             }
             while let Some(c) = chars.next() {
-                if c == '}' { break; }
+                if c == '}' {
+                    break;
+                }
             }
         } else if ch == '(' {
             // Skip entire group if it contains alternation — extracting literals
@@ -203,9 +206,16 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
             let saved = chars.clone();
             while let Some(c) = chars.next() {
                 match c {
-                    '\\' => { chars.next(); }
+                    '\\' => {
+                        chars.next();
+                    }
                     '(' => depth += 1,
-                    ')' => { depth -= 1; if depth == 0 { break; } }
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
                     '|' if depth == 1 => has_alt = true,
                     _ => {}
                 }
@@ -218,7 +228,16 @@ fn extract_literal_runs(pattern: &str) -> Vec<String> {
                     let mut lookahead = chars.clone();
                     lookahead.next();
                     if let Some(&after) = lookahead.peek() {
-                        if ":PimsxuU-<!=".contains(after) {
+                        // Flag-group prefix chars the rust `regex` crate accepts:
+                        // `i` `m` `s` `x` `u` `U` (standard) plus `R` (CRLF
+                        // line-terminator mode); plus `:` (end of flag prefix
+                        // before the group body), `P` (named-group `(?P<…>`),
+                        // `-` (negate flag), `<`/`!`/`=` (lookaround prefixes).
+                        // Missing one of these means the parser falls into
+                        // the literal extractor and pulls trigrams from the
+                        // regex syntax — which won't exist in source files
+                        // and produces a false-empty candidate set.
+                        if ":PimRsxuU-<!=".contains(after) {
                             chars.next();
                             while let Some(&c) = chars.peek() {
                                 if c == ':' || c == ')' {
@@ -255,49 +274,6 @@ fn is_meta(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- extract_trigrams tests (ported from trigram.test.ts) ---
-
-    #[test]
-    fn empty_string_returns_no_trigrams() {
-        assert_eq!(extract_trigrams("").len(), 0);
-    }
-
-    #[test]
-    fn short_string_returns_no_trigrams() {
-        assert_eq!(extract_trigrams("ab").len(), 0);
-    }
-
-    #[test]
-    fn extracts_single_trigram_from_3_char_string() {
-        let result = extract_trigrams("abc");
-        assert_eq!(result.len(), 1);
-        assert!(result.contains(&[b'a', b'b', b'c']));
-    }
-
-    #[test]
-    fn extracts_all_trigrams_from_a_word() {
-        let result = extract_trigrams("hello");
-        assert_eq!(result.len(), 3);
-        assert!(result.contains(&[b'h', b'e', b'l']));
-        assert!(result.contains(&[b'e', b'l', b'l']));
-        assert!(result.contains(&[b'l', b'l', b'o']));
-    }
-
-    #[test]
-    fn deduplicates_repeated_trigrams() {
-        let result = extract_trigrams("aaaa");
-        assert_eq!(result.len(), 1);
-        assert!(result.contains(&[b'a', b'a', b'a']));
-    }
-
-    #[test]
-    fn handles_unicode_characters() {
-        let result = extract_trigrams("café");
-        assert!(result.len() > 0);
-        // "caf" should be present as bytes
-        assert!(result.contains(&[b'c', b'a', b'f']));
-    }
 
     // --- decompose_pattern tests (ported from decomposeRegex in trigram.test.ts) ---
 
@@ -369,7 +345,6 @@ mod tests {
         // Should not panic; result depends on implementation details
         assert!(result.len() >= 1);
     }
-
 
     #[test]
     fn char_class_not_treated_as_literal() {

@@ -1,22 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use ignore::WalkBuilder;
 
-use crate::trigram;
+use crate::searcher::is_known_text_ext;
 
 pub struct IndexStats {
     pub num_docs: usize,
     pub num_ngrams: usize,
     pub estimated_ram_bytes: usize,
     pub avg_postings_len: f64,
-}
-
-pub struct SearchStats {
-    pub candidates: usize,
-    pub verified: usize,
-    pub false_positive_rate: f64,
 }
 
 /// A posting entry: (doc_id, line_no, byte_offset, line_prefix).
@@ -86,103 +80,6 @@ impl SparseIndex {
         }
     }
 
-    pub fn search(&self, pattern: &str) -> Vec<&Path> {
-        let (candidates, _) = self.search_inner(pattern);
-        candidates
-    }
-
-    pub fn search_with_stats(&self, pattern: &str, verified_count: usize) -> SearchStats {
-        let (candidates, _) = self.search_inner(pattern);
-        let num_candidates = candidates.len();
-        let false_positives = if num_candidates > 0 {
-            num_candidates.saturating_sub(verified_count)
-        } else {
-            0
-        };
-        let fp_rate = if num_candidates > 0 {
-            false_positives as f64 / num_candidates as f64
-        } else {
-            0.0
-        };
-        SearchStats {
-            candidates: num_candidates,
-            verified: verified_count,
-            false_positive_rate: fp_rate,
-        }
-    }
-
-    fn search_inner(&self, pattern: &str) -> (Vec<&Path>, usize) {
-        let alternatives = trigram::decompose_pattern(pattern);
-
-        // If no useful trigrams, fall back to full scan
-        if alternatives.is_empty() || alternatives.iter().all(|a| a.is_empty()) {
-            let all: Vec<&Path> = self.doc_ids.iter().map(|p| p.as_path()).collect();
-            let len = all.len();
-            return (all, len);
-        }
-
-        let mut result_lines: HashSet<(u32, u32)> = HashSet::new();
-
-        for alt_trigrams in &alternatives {
-            if alt_trigrams.is_empty() {
-                let all: Vec<&Path> = self.doc_ids.iter().map(|p| p.as_path()).collect();
-                let len = all.len();
-                return (all, len);
-            }
-
-            // Check if all trigrams exist in index
-            let all_present = alt_trigrams.iter().all(|tri| self.ngrams.contains_key(tri));
-            if !all_present {
-                continue;
-            }
-
-            // Sort trigrams by posting list size (smallest first) for fast intersection
-            let mut sorted: Vec<&[u8; 3]> = alt_trigrams.iter().collect();
-            sorted.sort_by_key(|tri| self.ngrams.get(*tri).map_or(0, |v| v.len()));
-
-            // Intersect on (doc_id, line_no) — trigrams must appear on the same line
-            let first_postings = match self.ngrams.get(sorted[0]) {
-                Some(p) => p,
-                None => continue,
-            };
-            let mut candidates: HashSet<(u32, u32)> = first_postings
-                .iter()
-                .map(|&(doc_id, line_no, _, _)| (doc_id, line_no))
-                .collect();
-
-            for tri in &sorted[1..] {
-                if candidates.is_empty() {
-                    break;
-                }
-                if let Some(postings) = self.ngrams.get(*tri) {
-                    let line_set: HashSet<(u32, u32)> = postings
-                        .iter()
-                        .map(|&(doc_id, line_no, _, _)| (doc_id, line_no))
-                        .collect();
-                    candidates.retain(|k| line_set.contains(k));
-                } else {
-                    candidates.clear();
-                    break;
-                }
-            }
-
-            result_lines.extend(candidates);
-        }
-
-        // Extract unique doc_ids and map to paths
-        let mut unique_docs: HashSet<u32> = HashSet::new();
-        for &(doc_id, _) in &result_lines {
-            unique_docs.insert(doc_id);
-        }
-
-        let results: Vec<&Path> = unique_docs
-            .iter()
-            .filter_map(|&id| self.doc_ids.get(id as usize).map(|p| p.as_path()))
-            .collect();
-        let len = results.len();
-        (results, len)
-    }
-
     pub fn stats(&self) -> IndexStats {
         let num_docs = self.doc_ids.len();
         let num_ngrams = self.ngrams.len();
@@ -207,7 +104,7 @@ impl SparseIndex {
     pub fn build_from_directory(
         root: &Path,
         no_ignore: bool,
-        type_filter: Option<&str>,
+        type_filter: &[String],
         verbose: bool,
     ) -> Result<Self> {
         // Phase 1: collect all file paths
@@ -224,26 +121,14 @@ impl SparseIndex {
             }
             let path = entry.path();
 
-            if let Some(ext_filter) = type_filter {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some(ext) if ext == ext_filter => {}
-                    _ => continue,
-                }
+            if !crate::searcher::passes_type_filter(path, type_filter) {
+                continue;
             }
 
             paths.push(path.to_path_buf());
         }
 
-        // Phase 2: build corpus-adaptive bigram frequency table
-        let _freq = crate::sparse::BigramFreq::from_corpus(&paths, 3000);
-        if verbose {
-            eprintln!(
-                "  built bigram freq table from {} file sample",
-                paths.len().min(3000)
-            );
-        }
-
-        // Phase 3: index all files
+        // Phase 2: index all files
         let mut index = SparseIndex::new();
         let mut count = 0u32;
         for path in &paths {
@@ -251,7 +136,14 @@ impl SparseIndex {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if content.iter().take(512).any(|&b| b == 0) {
+            // Match `search_full_scan`'s binary-detection rule so the
+            // indexed and direct-scan paths see the same set of files.
+            // Known text extensions (`.txt`, `.rs`, etc.) trust the
+            // extension and bypass the null-byte heuristic — fixtures
+            // can legitimately contain `\0` and we don't want to drop
+            // them from the index when the direct scan would still
+            // search them.
+            if !is_known_text_ext(path) && content.iter().take(512).any(|&b| b == 0) {
                 continue;
             }
 
@@ -280,51 +172,6 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn finds_documents_containing_a_literal_pattern() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(Path::new("a.ts"), b"const hello = 'world';");
-        idx.add_document(Path::new("b.ts"), b"function goodbye() {}");
-        idx.add_document(Path::new("c.ts"), b"say hello to everyone");
-
-        let results = idx.search("hello");
-        assert!(results.contains(&&*Path::new("a.ts")));
-        assert!(results.contains(&&*Path::new("c.ts")));
-        assert!(!results.contains(&&*Path::new("b.ts")));
-    }
-
-    #[test]
-    fn returns_empty_when_pattern_not_found() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(Path::new("a.ts"), b"const x = 1;");
-
-        let results = idx.search("zzzzz");
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn returns_all_docs_for_short_patterns() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(Path::new("a.ts"), b"abc");
-        idx.add_document(Path::new("b.ts"), b"def");
-
-        let results = idx.search("xy");
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn handles_alternation_patterns() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(Path::new("a.ts"), b"function hello() {}");
-        idx.add_document(Path::new("b.ts"), b"const world = 1;");
-        idx.add_document(Path::new("c.ts"), b"nothing here");
-
-        let results = idx.search("hello|world");
-        assert!(results.contains(&&*Path::new("a.ts")));
-        assert!(results.contains(&&*Path::new("b.ts")));
-        assert!(!results.contains(&&*Path::new("c.ts")));
-    }
-
-    #[test]
     fn reports_correct_stats() {
         let mut idx = SparseIndex::new();
         idx.add_document(Path::new("a.ts"), b"hello world");
@@ -334,40 +181,5 @@ mod tests {
         assert_eq!(stats.num_docs, 2);
         assert!(stats.num_ngrams > 0);
         assert!(stats.avg_postings_len > 0.0);
-    }
-
-    #[test]
-    fn intersects_trigrams_correctly_and_logic() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(Path::new("a.ts"), b"import React from 'react'");
-        idx.add_document(Path::new("b.ts"), b"import Vue from 'vue'");
-        idx.add_document(Path::new("c.ts"), b"React component here");
-
-        let results = idx.search("React");
-        assert!(results.contains(&&*Path::new("a.ts")));
-        assert!(results.contains(&&*Path::new("c.ts")));
-        assert!(!results.contains(&&*Path::new("b.ts")));
-    }
-
-    #[test]
-    fn line_level_intersection_finds_real_match() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(
-            Path::new("test1.rs"),
-            b"fn main() { println!(\"hello\"); }",
-        );
-        idx.add_document(Path::new("test2.rs"), b"priority control ntly");
-
-        let results = idx.search("println");
-        assert!(results.contains(&&*Path::new("test1.rs")));
-    }
-
-    #[test]
-    fn search_with_stats_returns_valid_metrics() {
-        let mut idx = SparseIndex::new();
-        idx.add_document(Path::new("a.rs"), b"hello world foo bar baz");
-        let stats = idx.search_with_stats("hello", 1);
-        assert!(stats.candidates >= 1);
-        assert_eq!(stats.verified, 1);
     }
 }

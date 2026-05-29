@@ -31,16 +31,17 @@ fn bench_patterns(c: &mut Criterion) {
     for pattern in &patterns {
         group.bench_function(format!("full_scan/{}", pattern), |b| {
             b.iter(|| {
-                fast_grep::searcher::search_full_scan(&dir, pattern, false, None).unwrap();
-            });
-        });
-
-        // Build index once, then benchmark search only
-        let idx = fast_grep::index::SparseIndex::build_from_directory(&dir, false, None, false)
-            .unwrap();
-        group.bench_function(format!("inmem_search/{}", pattern), |b| {
-            b.iter(|| {
-                let _candidates = idx.search(pattern);
+                fast_grep::searcher::search_full_scan(
+                    &dir,
+                    pattern,
+                    false,
+                    false,
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                )
+                .unwrap();
             });
         });
     }
