@@ -364,7 +364,28 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
     // produce per-file aggregates (counts, file lists) or no output at
     // all, so context flags don't apply and the simpler Vec<Match> API
     // is what we want.
-    if opts.count || opts.files_only || opts.quiet {
+    // quiet only needs a yes/no answer — stop the walk at the first match
+    // instead of opening and scanning the entire tree.
+    if opts.quiet {
+        let found = searcher::search_full_scan_any(
+            dir,
+            pattern,
+            opts.no_ignore,
+            opts.hidden,
+            &opts.file_type,
+            &opts.include,
+            &opts.exclude,
+            opts.invert,
+        )?;
+        if !found {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // count / files-only produce per-file aggregates; they bypass the render
+    // pipeline (context flags don't apply) and use the simpler Vec<Match> API.
+    if opts.count || opts.files_only {
         let start = Instant::now();
         let matches = searcher::search_full_scan(
             dir,
@@ -378,16 +399,11 @@ fn run_direct_search(pattern: &str, dir: &std::path::Path, opts: &SearchOpts) ->
         )?;
         let elapsed = start.elapsed();
         output_summary(&matches, opts)?;
-        if !opts.quiet {
-            eprintln!(
-                "Searched in {:.2}ms, {} matches",
-                elapsed.as_secs_f64() * 1000.0,
-                matches.len()
-            );
-        }
-        if opts.quiet && matches.is_empty() {
-            std::process::exit(1);
-        }
+        eprintln!(
+            "Searched in {:.2}ms, {} matches",
+            elapsed.as_secs_f64() * 1000.0,
+            matches.len()
+        );
         return Ok(());
     }
 
