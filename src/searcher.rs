@@ -1410,6 +1410,110 @@ pub fn search_full_scan_count(
     Ok(total_count.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Existence-only full scan for the `-q`/quiet flag. Returns `true` as soon as
+/// any file matches and stops the entire parallel walk (`WalkState::Quit`) — no
+/// need to open the rest of the tree once the yes/no answer is known. On a corpus
+/// where the open() cost dominates (e.g. NTFS behind an EDR filter stack), this
+/// turns a full-tree scan into "open files until the first hit".
+pub fn search_full_scan_any(
+    root: &Path,
+    pattern: &str,
+    no_ignore: bool,
+    hidden: bool,
+    type_filter: &[String],
+    include: &[String],
+    exclude: &[String],
+    invert: bool,
+) -> Result<bool> {
+    let matcher = Matcher::new(pattern)?;
+    let found = std::sync::atomic::AtomicBool::new(false);
+
+    let mut wb = ignore::WalkBuilder::new(root);
+    wb.git_ignore(!no_ignore)
+        .hidden(!hidden)
+        .threads(num_cpus());
+    if let Some(ov) = build_overrides(root, include, exclude)? {
+        wb.overrides(ov);
+    }
+    let walker = wb.build_parallel();
+
+    let type_filter_owned: Vec<String> = type_filter.to_vec();
+
+    walker.run(|| {
+        let matcher = &matcher;
+        let found = &found;
+        let type_filter = type_filter_owned.as_slice();
+        let mut read_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+
+        Box::new(move |entry| {
+            if found.load(std::sync::atomic::Ordering::Relaxed) {
+                return ignore::WalkState::Quit;
+            }
+
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+
+            let path = entry.path();
+
+            if !passes_type_filter(path, type_filter) {
+                return ignore::WalkState::Continue;
+            }
+
+            read_buf.clear();
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => return ignore::WalkState::Continue,
+            };
+            let flen = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if flen == 0 {
+                return ignore::WalkState::Continue;
+            }
+
+            let _mmap_holder;
+            let buf: &[u8] = if flen > 256 * 1024 {
+                _mmap_holder = unsafe { memmap2::Mmap::map(&file).ok() };
+                match _mmap_holder.as_ref() {
+                    Some(m) => m,
+                    None => return ignore::WalkState::Continue,
+                }
+            } else {
+                _mmap_holder = None;
+                use std::io::Read;
+                let mut f = file;
+                if f.read_to_end(&mut read_buf).is_err() {
+                    return ignore::WalkState::Continue;
+                }
+                &read_buf[..]
+            };
+
+            if !is_known_text_ext(path) && is_binary(buf) {
+                return ignore::WalkState::Continue;
+            }
+
+            let lbl = needs_line_by_line(pattern);
+            let hit = if invert {
+                matcher.count_non_match_lines(buf, lbl) > 0
+            } else {
+                matcher.has_match(buf, lbl)
+            };
+            if hit {
+                found.store(true, std::sync::atomic::Ordering::Relaxed);
+                return ignore::WalkState::Quit;
+            }
+
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(found.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 // `search_full_scan_streaming` (the inline-format streaming path) was
 // removed in the render-pipeline refactor. Its responsibilities now belong
 // to `crate::render::search_full_scan_render` with `Dispatch::Streaming`,
