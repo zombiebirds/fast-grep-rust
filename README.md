@@ -44,9 +44,9 @@ Built at **[Globant](https://www.globant.com)** for agent harnesses and large co
 
 Four techniques combine to eliminate >99% of I/O before the regex engine runs:
 
-1. **Sparse n-grams with adaptive frequency table** — Variable-length substrings weighted by corpus-specific bigram rarity. Produces fewer, more selective posting lists than fixed trigrams.
+1. **Trigram inverted index** — Each 3-byte trigram maps to the lines that contain it. A query is decomposed into the trigrams it must contain, so only lines carrying *all* of them survive as candidates — typically a tiny fraction of the corpus.
 
-2. **Position masks (Blackbird algorithm)** — Two 8-bit bloom filters per (n-gram, document) encode position and successor character. Drops the false positive rate to 0.42%.
+2. **Two-tier Roaring bitmaps** — Tier 1 is a compressed doc-id set per trigram: the file-level intersection runs as a Roaring-bitmap AND, skipping most files before any posting list is read. Only the surviving files load Tier 2 (the line-level postings).
 
 3. **Persistent index with mmap** — Binary posting lists memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
 
