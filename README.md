@@ -38,11 +38,11 @@ Built at **[Globant](https://www.globant.com)** for agent harnesses and large co
 | Full build | ~60s (one-time) |
 | Incremental update | <1s for 10–100 files (75x faster than rebuild) |
 | Index load (mmap) | 17ms |
-| Index size | 775 MB postings + 161 MB bitmaps |
+| Index size | ~2.7 GB postings + 162 MB bitmaps |
 
 ## How it works
 
-Five techniques combine to eliminate >99% of I/O before the regex engine runs:
+Four techniques combine to eliminate >99% of I/O before the regex engine runs:
 
 1. **Sparse n-grams with adaptive frequency table** — Variable-length substrings weighted by corpus-specific bigram rarity. Produces fewer, more selective posting lists than fixed trigrams.
 
@@ -51,8 +51,6 @@ Five techniques combine to eliminate >99% of I/O before the regex engine runs:
 3. **Persistent index with mmap** — Binary posting lists memory-mapped at query time. 17ms load regardless of corpus size; the OS pages in only the lists you touch.
 
 4. **Line-level index with byte offsets** — Index stores line positions, not just file IDs. Verification jumps directly to candidate lines instead of scanning entire files.
-
-5. **4-byte content prefix filter** — Before running the regex engine, checks a 4-byte content prefix per candidate. Eliminates 95%+ of I/O during verification.
 
 ## Installation
 

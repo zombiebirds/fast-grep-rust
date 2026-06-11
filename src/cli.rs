@@ -433,9 +433,15 @@ fn run_indexed_search(
     // meta.json (the same probe persist::load uses internally). The build root
     // is the search PATH the user passed — this matches the natural intent
     // "give me a fast search over this directory."
-    if !idx_path.join("meta.json").exists() {
+    if !persist::is_current(idx_path) {
+        let reason = if idx_path.join("meta.json").exists() {
+            "outdated (format changed)"
+        } else {
+            "not found"
+        };
         eprintln!(
-            "Index not found at {} — building one-time (subsequent searches will be <200ms)…",
+            "Index {} at {} — building one-time (subsequent searches will be <200ms)…",
+            reason,
             idx_path.display()
         );
         let build_start = Instant::now();

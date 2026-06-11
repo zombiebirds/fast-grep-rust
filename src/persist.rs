@@ -13,7 +13,13 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use crate::index::{Posting, SparseIndex};
+use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
+
+/// On-disk index format version. Bumped to 4 for the compact (delta-varint)
+/// posting format; the loader rejects older indices so they get rebuilt rather
+/// than decoded with the wrong reader.
+const INDEX_VERSION: u32 = 4;
 
 // --- Zero-copy read helpers ---
 
@@ -37,11 +43,8 @@ fn read_u64_le(data: &[u8], off: usize) -> u64 {
 }
 
 /// Sorted merge intersection of two sorted line-posting slices.
-/// Intersects on (doc_id, line_no), keeps byte_offset and prefix from `a`.
-fn sorted_intersect_lines(
-    a: &[(u32, u32, u32, [u8; 4])],
-    b: &[(u32, u32, u32, [u8; 4])],
-) -> Vec<(u32, u32, u32, [u8; 4])> {
+/// Intersects on (doc_id, line_no), keeps byte_offset from `a`.
+fn sorted_intersect_lines(a: &[(u32, u32, u32)], b: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
     let mut result = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -61,10 +64,7 @@ fn sorted_intersect_lines(
 }
 
 /// Merge two sorted line-posting slices into a new sorted Vec (union).
-fn merge_sorted_lines(
-    a: &[(u32, u32, u32, [u8; 4])],
-    b: &[(u32, u32, u32, [u8; 4])],
-) -> Vec<(u32, u32, u32, [u8; 4])> {
+fn merge_sorted_lines(a: &[(u32, u32, u32)], b: &[(u32, u32, u32)]) -> Vec<(u32, u32, u32)> {
     let mut result = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
@@ -113,7 +113,6 @@ pub struct LineHit<'a> {
     pub path: &'a Path,
     pub line_no: u32,
     pub byte_offset: u32,
-    pub line_prefix: [u8; 4],
 }
 
 /// Search result from the index: either precise line-level hits or fallback to all files.
@@ -143,6 +142,12 @@ pub struct IndexMeta {
     /// Number of docs in the main (non-delta) index. Set on full build.
     #[serde(default)]
     pub main_num_docs: Option<usize>,
+    /// Whether this index was built over case-folded text (a case-insensitive
+    /// index). `false` (default) = case-sensitive. Set when building the CI
+    /// index so `-i` searches can route to it. Reserved in v4 for the planned
+    /// dual case-sensitive / case-insensitive index pair.
+    #[serde(default)]
+    pub case_insensitive: bool,
 }
 
 #[derive(Clone)]
@@ -153,7 +158,6 @@ pub struct LookupEntry {
 }
 
 const LOOKUP_ENTRY_SIZE: usize = 4 + 8 + 4; // 16 bytes
-const POSTING_ENTRY_SIZE: usize = 16; // doc_id(u32) + line_no(u32) + byte_offset(u32) + prefix([u8;4])
 
 pub struct PersistentIndex {
     /// Main lookup table — memory-mapped for zero-copy binary search
@@ -233,7 +237,7 @@ impl PersistentIndex {
         let (offset, len) = self.find_in_main_lookup(hash)?;
         let start = offset as usize;
         let end = start + len as usize;
-        if end <= self.postings_mmap.len() && (end - start) % POSTING_ENTRY_SIZE == 0 {
+        if end <= self.postings_mmap.len() {
             Some(&self.postings_mmap[start..end])
         } else {
             None
@@ -253,7 +257,7 @@ impl PersistentIndex {
         let entry = &self.delta_lookup[idx];
         let start = entry.offset as usize;
         let end = start + entry.len as usize;
-        if end <= self.delta_postings.len() && (end - start) % POSTING_ENTRY_SIZE == 0 {
+        if end <= self.delta_postings.len() {
             Some(&self.delta_postings[start..end])
         } else {
             None
@@ -299,19 +303,12 @@ impl PersistentIndex {
         RoaringBitmap::deserialize_unchecked_from(&bm_data[start..end]).ok()
     }
 
-    /// Extract sorted line postings from raw posting bytes, excluding deleted docs.
-    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32, [u8; 4])> {
-        let num = data.len() / POSTING_ENTRY_SIZE;
-        let mut postings = Vec::with_capacity(num);
-        for i in 0..num {
-            let base = i * POSTING_ENTRY_SIZE;
-            let doc_id = read_u32_le(data, base);
+    /// Extract sorted line postings from a compact posting blob, excluding deleted docs.
+    fn extract_line_postings(&self, data: &[u8]) -> Vec<(u32, u32, u32)> {
+        let mut postings = Vec::new();
+        for (doc_id, line_no, byte_offset) in PostingReader::new(data) {
             if !self.deleted_docs.contains(&doc_id) {
-                let line_no = read_u32_le(data, base + 4);
-                let byte_offset = read_u32_le(data, base + 8);
-                let mut prefix = [0u8; 4];
-                prefix.copy_from_slice(&data[base + 12..base + 16]);
-                postings.push((doc_id, line_no, byte_offset, prefix));
+                postings.push((doc_id, line_no, byte_offset));
             }
         }
         postings
@@ -322,18 +319,11 @@ impl PersistentIndex {
         &self,
         data: &[u8],
         filter: &RoaringBitmap,
-    ) -> Vec<(u32, u32, u32, [u8; 4])> {
-        let num = data.len() / POSTING_ENTRY_SIZE;
-        let mut postings = Vec::with_capacity(num / 4); // expect significant filtering
-        for i in 0..num {
-            let base = i * POSTING_ENTRY_SIZE;
-            let doc_id = read_u32_le(data, base);
+    ) -> Vec<(u32, u32, u32)> {
+        let mut postings = Vec::new();
+        for (doc_id, line_no, byte_offset) in PostingReader::new(data) {
             if filter.contains(doc_id) && !self.deleted_docs.contains(&doc_id) {
-                let line_no = read_u32_le(data, base + 4);
-                let byte_offset = read_u32_le(data, base + 8);
-                let mut prefix = [0u8; 4];
-                prefix.copy_from_slice(&data[base + 12..base + 16]);
-                postings.push((doc_id, line_no, byte_offset, prefix));
+                postings.push((doc_id, line_no, byte_offset));
             }
         }
         postings
@@ -345,7 +335,7 @@ impl PersistentIndex {
         &self,
         hash: u32,
         filter: &RoaringBitmap,
-    ) -> Option<Vec<(u32, u32, u32, [u8; 4])>> {
+    ) -> Option<Vec<(u32, u32, u32)>> {
         let main = self.main_posting_data(hash);
         let delta = self.delta_posting_data(hash);
 
@@ -376,7 +366,7 @@ impl PersistentIndex {
     }
 
     /// Get merged (main + delta) sorted line postings for a trigram hash.
-    fn trigram_line_postings(&self, hash: u32) -> Option<Vec<(u32, u32, u32, [u8; 4])>> {
+    fn trigram_line_postings(&self, hash: u32) -> Option<Vec<(u32, u32, u32)>> {
         let main = self.main_posting_data(hash);
         let delta = self.delta_posting_data(hash);
 
@@ -455,7 +445,7 @@ impl PersistentIndex {
             );
         }
 
-        let mut result_lines: Vec<(u32, u32, u32, [u8; 4])> = Vec::new();
+        let mut result_lines: Vec<(u32, u32, u32)> = Vec::new();
         let mut bitmap_dur = Duration::ZERO;
         let mut intersect_dur = Duration::ZERO;
         let has_bitmaps = self.bitmap_mmap.is_some();
@@ -499,7 +489,7 @@ impl PersistentIndex {
                     bitmap_dur += t_bitmap.elapsed();
                     // Fallback: load postings directly without bitmap pre-filter
                     let t_fallback = Instant::now();
-                    let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = hashes
+                    let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
                         .par_iter()
                         .map(|&h| self.trigram_line_postings(h))
                         .collect();
@@ -507,7 +497,7 @@ impl PersistentIndex {
                         intersect_dur += t_fallback.elapsed();
                         continue;
                     }
-                    let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                    let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                         posting_lists.into_iter().map(|p| p.unwrap()).collect();
                     posting_lists.sort_by_key(|v| v.len());
                     let mut candidates = posting_lists.swap_remove(0);
@@ -583,27 +573,26 @@ impl PersistentIndex {
                 let t_intersect = Instant::now();
                 let bm_selectivity = bm_card as f64 / self.num_docs().max(1) as f64;
 
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> =
-                    if bm_selectivity < 0.5 {
-                        // Bitmap is selective — use filtered extraction
-                        hashes
-                            .par_iter()
-                            .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs))
-                            .collect()
-                    } else {
-                        // Bitmap isn't selective — full extraction is faster
-                        hashes
-                            .par_iter()
-                            .map(|&h| self.trigram_line_postings(h))
-                            .collect()
-                    };
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = if bm_selectivity < 0.5 {
+                    // Bitmap is selective — use filtered extraction
+                    hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings_filtered(h, &candidate_docs))
+                        .collect()
+                } else {
+                    // Bitmap isn't selective — full extraction is faster
+                    hashes
+                        .par_iter()
+                        .map(|&h| self.trigram_line_postings(h))
+                        .collect()
+                };
 
                 if posting_lists.iter().any(|p| p.is_none()) {
                     intersect_dur += t_intersect.elapsed();
                     continue;
                 }
 
-                let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                     posting_lists.into_iter().map(|p| p.unwrap()).collect();
                 posting_lists.sort_by_key(|v| v.len());
 
@@ -620,7 +609,7 @@ impl PersistentIndex {
                 // === Fallback: original sorted merge approach (no bitmap files) ===
 
                 let t_lookup = Instant::now();
-                let posting_lists: Vec<Option<Vec<(u32, u32, u32, [u8; 4])>>> = hashes
+                let posting_lists: Vec<Option<Vec<(u32, u32, u32)>>> = hashes
                     .par_iter()
                     .map(|&h| self.trigram_line_postings(h))
                     .collect();
@@ -631,7 +620,7 @@ impl PersistentIndex {
                 }
 
                 let t_intersect = Instant::now();
-                let mut posting_lists: Vec<Vec<(u32, u32, u32, [u8; 4])>> =
+                let mut posting_lists: Vec<Vec<(u32, u32, u32)>> =
                     posting_lists.into_iter().map(|p| p.unwrap()).collect();
                 posting_lists.sort_by_key(|v| v.len());
 
@@ -654,12 +643,11 @@ impl PersistentIndex {
         let num_candidates = result_lines.len();
         let hits: Vec<LineHit<'_>> = result_lines
             .iter()
-            .filter_map(|&(doc_id, line_no, byte_offset, line_prefix)| {
+            .filter_map(|&(doc_id, line_no, byte_offset)| {
                 self.doc_path(doc_id).map(|path| LineHit {
                     path,
                     line_no,
                     byte_offset,
-                    line_prefix,
                 })
             })
             .collect();
@@ -743,7 +731,7 @@ pub fn build(
     // Collect directory mtimes for fast stale detection
     let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
-    // Write postings and build lookup (12 bytes per entry: doc_id + line_no + byte_offset)
+    // Write compact (delta-varint) postings and build lookup (offset/len per trigram)
     let postings_path = output.join("ngrams.postings");
     let mut postings_file = BufWriter::new(File::create(&postings_path)?);
     let mut lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
@@ -754,12 +742,10 @@ pub fn build(
     trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
 
     for (tri, postings) in &trigram_list {
-        let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
-        for &(doc_id, line_no, byte_offset, prefix) in *postings {
-            buf.write_u32::<LittleEndian>(doc_id)?;
-            buf.write_u32::<LittleEndian>(line_no)?;
-            buf.write_u32::<LittleEndian>(byte_offset)?;
-            buf.write_all(&prefix)?;
+        let mut buf = Vec::with_capacity(postings.len() * 3);
+        let mut w = PostingWriter::new();
+        for &(doc_id, line_no, byte_offset) in *postings {
+            w.push(&mut buf, doc_id, line_no, byte_offset);
         }
         let len = buf.len() as u32;
         postings_file.write_all(&buf)?;
@@ -786,7 +772,7 @@ pub fn build(
 
     for (tri, postings) in &trigram_list {
         let mut bitmap = RoaringBitmap::new();
-        for &(doc_id, _, _, _) in *postings {
+        for &(doc_id, _, _) in *postings {
             bitmap.insert(doc_id);
         }
         let mut bm_buf = Vec::new();
@@ -821,7 +807,7 @@ pub fn build(
     // Write meta
     let num_docs = index.doc_ids.len();
     let meta = IndexMeta {
-        version: 3, // bump version for line-level index format
+        version: INDEX_VERSION,
         num_docs,
         num_ngrams: index.ngrams.len(),
         root_dir: root.to_string_lossy().into_owned(),
@@ -829,6 +815,7 @@ pub fn build(
         file_mtimes,
         dir_mtimes,
         main_num_docs: Some(num_docs),
+        case_insensitive: false,
     };
     let meta_path = output.join("meta.json");
     let meta_json = serde_json::to_string_pretty(&meta)?;
@@ -854,10 +841,31 @@ pub fn build(
     Ok(())
 }
 
+/// True if an index exists at `idx_path` and is the current on-disk format
+/// version. Callers use this to decide whether to (re)build before searching or
+/// updating — a missing OR stale-version index returns `false`.
+pub fn is_current(idx_path: &Path) -> bool {
+    match fs::read_to_string(idx_path.join("meta.json")) {
+        Ok(s) => serde_json::from_str::<IndexMeta>(&s)
+            .map(|m| m.version == INDEX_VERSION)
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     let meta_path = index_path.join("meta.json");
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
+
+    if meta.version != INDEX_VERSION {
+        anyhow::bail!(
+            "index at {} is version {} but this build expects version {} (posting format changed); rebuild with `fgr index`",
+            index_path.display(),
+            meta.version,
+            INDEX_VERSION
+        );
+    }
 
     // Load main lookup via mmap (zero-copy binary search)
     let lookup_path = index_path.join("ngrams.lookup");
@@ -995,6 +1003,17 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let meta_path = index_path.join("meta.json");
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
+    // An incremental update only rewrites the delta; it cannot mix a new-format
+    // delta into an old-format main index without corrupting it. Refuse on a
+    // version mismatch — the caller (or the search auto-build) rebuilds instead.
+    if meta.version != INDEX_VERSION {
+        anyhow::bail!(
+            "index at {} is version {} but this build expects version {}; run `fgr index` to rebuild",
+            index_path.display(),
+            meta.version,
+            INDEX_VERSION
+        );
+    }
     let saved_mtimes = meta.file_mtimes;
     let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
 
@@ -1147,19 +1166,14 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
             if line.len() >= 3 {
                 seen_on_line.clear();
                 let byte_offset = line_start as u32;
-                let mut prefix = [0u8; 4];
-                let copy_len = line.len().min(4);
-                prefix[..copy_len].copy_from_slice(&line[..copy_len]);
                 for w in line.windows(3) {
                     let tri = [w[0], w[1], w[2]];
                     if seen_on_line.insert(tri) {
                         let hash = crc32fast::hash(&tri);
-                        delta_ngrams.entry(hash).or_default().push((
-                            doc_id,
-                            line_no,
-                            byte_offset,
-                            prefix,
-                        ));
+                        delta_ngrams
+                            .entry(hash)
+                            .or_default()
+                            .push((doc_id, line_no, byte_offset));
                     }
                 }
             }
@@ -1209,12 +1223,10 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         let mut offset: u64 = 0;
 
         for (hash, postings) in &sorted_ngrams {
-            let mut buf = Vec::with_capacity(postings.len() * POSTING_ENTRY_SIZE);
-            for &(doc_id, line_no, byte_offset, prefix) in postings {
-                buf.write_u32::<LittleEndian>(doc_id)?;
-                buf.write_u32::<LittleEndian>(line_no)?;
-                buf.write_u32::<LittleEndian>(byte_offset)?;
-                buf.write_all(&prefix)?;
+            let mut buf = Vec::with_capacity(postings.len() * 3);
+            let mut w = PostingWriter::new();
+            for &(doc_id, line_no, byte_offset) in postings {
+                w.push(&mut buf, doc_id, line_no, byte_offset);
             }
             let len = buf.len() as u32;
             postings_file.write_all(&buf)?;
@@ -1262,7 +1274,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
 
     let total_docs = main_num_docs - main_deleted.len() + delta_doc_ids.len();
     let new_meta = IndexMeta {
-        version: 3,
+        version: INDEX_VERSION,
         num_docs: total_docs,
         num_ngrams: meta.num_ngrams,
         root_dir: root.to_string_lossy().into_owned(),
@@ -1270,6 +1282,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         file_mtimes: new_mtimes,
         dir_mtimes: new_dir_mtimes,
         main_num_docs: Some(main_num_docs),
+        case_insensitive: meta.case_insensitive,
     };
     let meta_json = serde_json::to_string_pretty(&new_meta)?;
     fs::write(&meta_path, meta_json)?;
