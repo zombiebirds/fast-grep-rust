@@ -95,6 +95,18 @@ impl PostingWriter {
         Self::default()
     }
 
+    /// The `(doc, line)` of the last posting pushed, or `None` if empty.
+    /// Used by the packed in-memory builder to dedup `(trigram, doc, line)`
+    /// without keeping the decoded postings around.
+    #[inline]
+    pub fn last_dl(&self) -> Option<(u32, u32)> {
+        if self.started {
+            Some((self.prev_doc, self.prev_line))
+        } else {
+            None
+        }
+    }
+
     /// Append one posting's bytes to `buf`.
     pub fn push(&mut self, buf: &mut Vec<u8>, doc: u32, line: u32, off: u32) {
         if self.started && doc == self.prev_doc {

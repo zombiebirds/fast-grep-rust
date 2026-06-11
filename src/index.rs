@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use ignore::WalkBuilder;
 
+use crate::postenc::PostingWriter;
 use crate::searcher::is_known_text_ext;
 
 pub struct IndexStats {
@@ -18,9 +19,24 @@ pub struct IndexStats {
 /// - byte_offset: byte offset of the start of that line in the file
 pub type Posting = (u32, u32, u32);
 
+/// Accumulates one trigram's posting list already in the compact
+/// (delta-varint) wire format. Postings are encoded into `bytes` as they are
+/// added, so the build never materializes the decoded `Vec<Posting>` for the
+/// whole corpus — that is what keeps the peak RAM near the on-disk size.
+#[derive(Default)]
+pub struct TrigramBuilder {
+    /// Compact-encoded postings, ready to be written to `ngrams.postings`
+    /// verbatim at serialize time.
+    pub bytes: Vec<u8>,
+    /// Delta state (prev doc/line/offset) for `bytes`.
+    writer: PostingWriter,
+    /// Number of postings encoded, for `stats()` / `avg_postings_len`.
+    count: u32,
+}
+
 pub struct SparseIndex {
-    /// Trigram → list of (doc_id, line_no, byte_offset)
-    pub ngrams: HashMap<[u8; 3], Vec<Posting>>,
+    /// Trigram → compact-encoded posting list of (doc_id, line_no, byte_offset)
+    pub ngrams: HashMap<[u8; 3], TrigramBuilder>,
     pub doc_ids: Vec<PathBuf>,
 }
 
@@ -57,13 +73,14 @@ impl SparseIndex {
                 let byte_offset = line_start as u32;
                 for w in line.windows(3) {
                     let tri = [w[0], w[1], w[2]];
-                    let entry = self.ngrams.entry(tri).or_default();
-                    // Dedup: only one posting per (doc_id, line_no) per trigram
-                    if entry
-                        .last()
-                        .map_or(true, |&(d, l, _)| d != doc_id || l != line_no)
-                    {
-                        entry.push((doc_id, line_no, byte_offset));
+                    let b = self.ngrams.entry(tri).or_default();
+                    // Dedup: only one posting per (doc_id, line_no) per trigram.
+                    // The windows over a line hit the same (doc, line) on every
+                    // repeat of a trigram, so checking the writer's last pushed
+                    // posting is enough — and lets us encode on the spot.
+                    if b.writer.last_dl() != Some((doc_id, line_no)) {
+                        b.writer.push(&mut b.bytes, doc_id, line_no, byte_offset);
+                        b.count += 1;
                     }
                 }
             }
@@ -81,11 +98,11 @@ impl SparseIndex {
         let num_ngrams = self.ngrams.len();
         let estimated_ram: usize = self
             .ngrams
-            .iter()
-            .map(|(_, v)| 3 + v.len() * 12 + 48) // key + Vec<(u32,u32,u32)> + overhead
+            .values()
+            .map(|b| 3 + b.bytes.len() + 48) // key + packed postings + overhead
             .sum();
         let avg_len = if num_ngrams > 0 {
-            self.ngrams.values().map(|v| v.len() as f64).sum::<f64>() / num_ngrams as f64
+            self.ngrams.values().map(|b| b.count as f64).sum::<f64>() / num_ngrams as f64
         } else {
             0.0
         };

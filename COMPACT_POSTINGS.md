@@ -70,17 +70,23 @@ small state + an already-encoded byte buffer:
 
 ```
 HashMap<[u8;3], TrigramBuilder>
-  TrigramBuilder { bytes: Vec<u8>, writer: PostingWriter }   // see postenc::PostingWriter
+  TrigramBuilder { bytes: Vec<u8>, writer: PostingWriter, count: u32 }   // see postenc::PostingWriter
 ```
 
 `add_document` appends each `(trigram, line)` posting straight into the trigram's
-`bytes` via the delta encoder. Documents and lines arrive in ascending order, so
-the deltas are valid without re-sorting. Serialization writes each `bytes` blob
-verbatim plus its lookup entry — no re-encode pass.
+`bytes` via the delta encoder, deduping `(trigram, doc, line)` against the
+writer's last pushed posting (`PostingWriter::last_dl`). Documents and lines
+arrive in ascending order, so the deltas are valid without re-sorting.
+Serialization writes each `bytes` blob verbatim plus its lookup entry — no
+re-encode pass. `count` is kept only for `stats()` / `avg_postings_len`.
 
-This drops the in-memory peak from ~15 GB to ~the packed size (~2.7 GB). The
-doc-level Roaring bitmaps (Tier 1, ~162 MB) are maintained in parallel by
-inserting `doc_id` on each new-document posting. **Projected build peak ≈ 4 GB.**
+The doc-level Roaring bitmaps (Tier 1, ~162 MB) are *not* held during the build;
+they are rebuilt at serialize time by decoding each trigram's `bytes` once with a
+`PostingReader` and inserting the `doc_id`s — a single cheap pass over the already
+packed data, so the build keeps no bitmap state in RAM.
+
+**Measured build peak: 3.4 GB** (down from ~12.5 GB with the Phase 1 flat
+`Vec<Posting>`, ~15 GB with the original 16-byte format).
 
 ## Unchanged components
 
@@ -136,20 +142,26 @@ merge-sorts; each being delta-encoded internally is irrelevant to the merge.
   **disk** win (~2.7 GB) and a partial RAM win (the in-memory `Vec<Posting>` drops
   from 16 → 12 bytes/posting, ~15 → ~11 GB build peak). Validated: indexed search
   matches the full scan; full lib/ round-trip is byte-for-byte correct.
-- **Phase 2 (next):** the packed in-memory build (encode each trigram's postings
-  into a `Vec<u8>` during `add_document` instead of holding `Vec<Posting>`),
-  taking the build peak from ~11 GB to ~4 GB.
+- **Phase 2 (done):** the packed in-memory build — `SparseIndex.ngrams` is now
+  `HashMap<[u8;3], TrigramBuilder>`, encoding each posting into the trigram's
+  `Vec<u8>` during `add_document` instead of holding `Vec<Posting>`. Bitmaps are
+  decoded from the packed bytes at serialize time. **Measured** build peak
+  12.5 GB → **3.4 GB**; build time 321 s → 249 s (verbatim write, no re-encode);
+  on-disk and search results unchanged (EXPORT_SYMBOL 35568, PM_RESUME 39 vs the
+  full scan). `update_incremental` keeps its small `Vec<Posting>` delta — no RAM
+  concern there.
 - **Phase 3:** the dual case-sensitive / case-insensitive index (`-i` builds both
   in one filesystem pass), now affordable at ~2 × the compact size.
 
-## Projected results (Linux kernel)
+## Results (Linux kernel, 79,406 docs — measured)
 
-| | current | compact |
-|---|---|---|
-| `ngrams.postings` on disk | 14.9 GB | **~2.7 GB** |
-| build RAM peak | ~15 GB | **~4 GB** |
-| factor | 1x | **~5.6x** |
-| dual case-insensitive index | infeasible (~30 GB) | **feasible (~5.4 GB)** |
+| | original (16 B flat) | Phase 1 (compact disk) | Phase 2 (packed build) |
+|---|---|---|---|
+| `ngrams.postings` on disk | 14.9 GB | **2.7 GB** | **2.7 GB** |
+| build RAM peak | ~15 GB | ~12.5 GB | **3.4 GB** |
+| build time | — | 321 s | **249 s** |
+| factor (disk / RAM) | 1x | 5.6x / 1.2x | **5.6x / ~4.4x** |
+| dual case-insensitive index | infeasible (~30 GB) | feasible (~5.4 GB) | **feasible (~5.4 GB)** |
 
 ## Per-field measurements (from `scripts`/probe over the real 1.0 B-posting index)
 

@@ -12,7 +12,7 @@ use rayon::prelude::*;
 
 use roaring::RoaringBitmap;
 
-use crate::index::{Posting, SparseIndex};
+use crate::index::{Posting, SparseIndex, TrigramBuilder};
 use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
 
@@ -738,17 +738,14 @@ pub fn build(
     let mut offset: u64 = 0;
 
     // Sort trigrams by hash for binary search
-    let mut trigram_list: Vec<(&[u8; 3], &Vec<Posting>)> = index.ngrams.iter().collect();
+    let mut trigram_list: Vec<(&[u8; 3], &TrigramBuilder)> = index.ngrams.iter().collect();
     trigram_list.sort_by_key(|(k, _)| crc32fast::hash(*k));
 
-    for (tri, postings) in &trigram_list {
-        let mut buf = Vec::with_capacity(postings.len() * 3);
-        let mut w = PostingWriter::new();
-        for &(doc_id, line_no, byte_offset) in *postings {
-            w.push(&mut buf, doc_id, line_no, byte_offset);
-        }
-        let len = buf.len() as u32;
-        postings_file.write_all(&buf)?;
+    // Postings are already compact-encoded in `builder.bytes` (encoded as the
+    // index was built), so we write them verbatim — no re-encode pass.
+    for (tri, builder) in &trigram_list {
+        let len = builder.bytes.len() as u32;
+        postings_file.write_all(&builder.bytes)?;
         lookup_entries.push((crc32fast::hash(*tri), offset, len));
         offset += len as u64;
     }
@@ -770,9 +767,9 @@ pub fn build(
     let mut bitmap_lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
     let mut bm_offset: u64 = 0;
 
-    for (tri, postings) in &trigram_list {
+    for (tri, builder) in &trigram_list {
         let mut bitmap = RoaringBitmap::new();
-        for &(doc_id, _, _) in *postings {
+        for (doc_id, _, _) in PostingReader::new(&builder.bytes) {
             bitmap.insert(doc_id);
         }
         let mut bm_buf = Vec::new();
