@@ -47,6 +47,16 @@ impl Default for TrigramBuilder {
     }
 }
 
+/// 256-bit "which bytes can follow this trigram" mask, packed as 8 × u32
+/// little-endian. Bit `b` of word `w` (where `w = b / 32`, `bit = b % 32`)
+/// is set when byte value `b` is observed to immediately follow an
+/// occurrence of the owning trigram somewhere in the corpus. This is the
+/// "successor mask" from Cursor's phrase-aware trigram index: it lets the
+/// searcher prune alternatives whose required follower is provably absent
+/// from the corpus (e.g. a regex that demands `int\d` returns zero
+/// candidates in a corpus where `int` is never followed by a digit).
+pub type FollowerMask = [u32; 8];
+
 pub struct SparseIndex {
     /// Trigram → compact-encoded posting list of (doc_id, line_no, byte_offset)
     pub ngrams: HashMap<[u8; 3], TrigramBuilder>,
@@ -56,6 +66,21 @@ pub struct SparseIndex {
     /// verification still reads the un-folded line.
     pub ngrams_ci: Option<HashMap<[u8; 3], TrigramBuilder>>,
     pub doc_ids: Vec<PathBuf>,
+    /// Per-trigram corpus-level follower mask (case-sensitive). Built in
+    /// lockstep with `ngrams` so a 4-byte query can be answered without
+    /// touching the postings.
+    pub masks: HashMap<[u8; 3], FollowerMask>,
+    /// Per-trigram corpus-level follower mask for the case-insensitive
+    /// companion. `None` for a plain case-sensitive index. Built over the
+    /// folded buffer so a `(?i)` query resolves against the same store.
+    pub masks_ci: Option<HashMap<[u8; 3], FollowerMask>>,
+}
+
+#[inline]
+fn set_mask_bit(mask: &mut FollowerMask, follower: u8) {
+    let word = (follower >> 5) & 0x7;
+    let bit = follower & 0x1F;
+    mask[word as usize] |= 1u32 << bit;
 }
 
 impl SparseIndex {
@@ -71,6 +96,12 @@ impl SparseIndex {
                 None
             },
             doc_ids: Vec::new(),
+            masks: HashMap::new(),
+            masks_ci: if case_insensitive {
+                Some(HashMap::new())
+            } else {
+                None
+            },
         }
     }
 
@@ -88,6 +119,12 @@ impl SparseIndex {
                 None
             },
             doc_ids: Vec::with_capacity(path_count),
+            masks: HashMap::with_capacity(cap),
+            masks_ci: if case_insensitive {
+                Some(HashMap::with_capacity(cap))
+            } else {
+                None
+            },
         }
     }
 
@@ -99,6 +136,23 @@ impl SparseIndex {
             return;
         }
 
+        // === Successor-mask pass ===
+        // We process the file as a single byte stream (not per-line) so the
+        // recorded followers include the byte that follows a trigram
+        // straddling a line break, e.g. `bc\n` followed by `d` of the next
+        // line. This matches the "trigram → follower" semantics in the
+        // Cursor phrase-aware trigram index. The mask just ORs bits, so a
+        // few "extra" followers for end-of-line trigrams that don't have a
+        // per-line entry in the ngrams map are harmless false positives —
+        // the mask is a pre-filter, never a soundness boundary.
+        for w in content.windows(4) {
+            let tri = [w[0], w[1], w[2]];
+            let follower = w[3];
+            let mask = self.masks.entry(tri).or_insert([0u32; 8]);
+            set_mask_bit(mask, follower);
+        }
+
+        // === Per-line trigram posting pass ===
         // Index trigrams per line: one posting per (trigram, doc_id, line)
         let mut line_no = 1u32;
         let mut line_start = 0usize;
@@ -154,6 +208,26 @@ impl SparseIndex {
             line_start = line_end + 1;
             line_no += 1;
         }
+
+        // === CI successor-mask pass ===
+        // Mirror the CS mask over the case-folded content so a `(?i)` query
+        // can be pre-filtered against the same store. We fold the whole file
+        // in one pass — unlike the line-level posting extraction above — to
+        // capture cross-line successors in the folded buffer. As with the CS
+        // mask, extra bits for trigrams that don't appear in the per-line
+        // map are harmless false positives (the mask is a pre-filter only).
+        if let Some(ref mut ci_masks) = self.masks_ci {
+            let mut file_fold = Vec::new();
+            casefold::fold_into(content, &mut file_fold);
+            if file_fold.len() >= 4 {
+                for w in file_fold.windows(4) {
+                    let tri = [w[0], w[1], w[2]];
+                    let follower = w[3];
+                    let mask = ci_masks.entry(tri).or_insert([0u32; 8]);
+                    set_mask_bit(mask, follower);
+                }
+            }
+        }
     }
 
     pub fn stats(&self) -> IndexStats {
@@ -166,6 +240,13 @@ impl SparseIndex {
             .sum();
         if let Some(ci) = &self.ngrams_ci {
             estimated_ram += ci.values().map(|b| 3 + b.bytes.len() + 48).sum::<usize>();
+        }
+        // Successor-mask RAM: 32 bytes per trigram for the raw 8×u32 plus
+        // HashMap overhead. The mask is independent of the posting list
+        // length, so it's purely a function of unique trigram count.
+        estimated_ram += self.masks.len() * (32 + 48);
+        if let Some(ci) = &self.masks_ci {
+            estimated_ram += ci.len() * (32 + 48);
         }
         let avg_len = if num_ngrams > 0 {
             self.ngrams.values().map(|b| b.count as f64).sum::<f64>() / num_ngrams as f64
@@ -294,5 +375,60 @@ mod tests {
         assert!(!ci.contains_key(b"Hel"));
         // The case-sensitive map keeps the original case.
         assert!(idx.ngrams.contains_key(b"Hel"));
+    }
+
+    /// Read one bit out of a 256-bit follower mask.
+    fn mask_bit(mask: &FollowerMask, b: u8) -> bool {
+        (mask[(b >> 5) as usize] >> (b & 0x1F)) & 1 == 1
+    }
+
+    #[test]
+    fn successor_mask_records_following_bytes() {
+        // "abcdefg" → trigrams abc/bcd/cde/def, each followed by the next byte.
+        let mut idx = SparseIndex::with_case_insensitive(false);
+        idx.add_document(Path::new("a.txt"), b"abcdefg");
+        let m = idx.masks.get(b"abc").expect("mask for abc");
+        assert!(mask_bit(m, b'd'), "'d' must be recorded as a follower of 'abc'");
+        assert!(!mask_bit(m, b'e'), "'e' must NOT follow 'abc' (it's two bytes away)");
+        // Trigram "def" is followed by 'g'.
+        let last = idx.masks.get(b"def").expect("mask for def");
+        assert!(mask_bit(last, b'g'), "'g' must follow 'def'");
+    }
+
+    #[test]
+    fn end_of_content_trigram_has_no_mask_entry() {
+        // "abc" (3 bytes) — there's no 4th byte, so no (trigram, follower)
+        // pair can be recorded. The mask map must not contain an entry for
+        // "abc" at all.
+        let mut idx = SparseIndex::with_case_insensitive(false);
+        idx.add_document(Path::new("a.txt"), b"abc");
+        assert!(
+            idx.masks.get(b"abc").is_none(),
+            "trigrams with no possible follower must not appear in the mask map"
+        );
+    }
+
+    #[test]
+    fn successor_mask_captures_cross_line_breaks() {
+        // "abc\ndef" — trigram "bc\n" straddles the line break, and its
+        // successor is 'd' (first byte of the next line). The whole-file
+        // stream pass must record this.
+        let mut idx = SparseIndex::with_case_insensitive(false);
+        idx.add_document(Path::new("a.txt"), b"abc\ndef");
+        let m = idx.masks.get(b"bc\n").expect("mask for bc\\n");
+        assert!(mask_bit(m, b'd'), "cross-line follower must be captured");
+    }
+
+    #[test]
+    fn ci_successor_mask_built_from_folded_content() {
+        // "ABCdef" → folded "abcdef". The trigram "abc" in the CI map must
+        // record 'd' as its follower (the 'D' in the source folds to 'd').
+        let mut idx = SparseIndex::with_case_insensitive(true);
+        idx.add_document(Path::new("a.txt"), b"ABCdef");
+        let ci_masks = idx.masks_ci.as_ref().expect("ci masks present");
+        let m = ci_masks.get(b"abc").expect("CI mask for folded abc");
+        assert!(mask_bit(m, b'd'), "CI mask must reflect folded follower");
+        // The un-folded trigram "ABC" should not have a CI mask entry.
+        assert!(!ci_masks.contains_key(b"ABC"));
     }
 }

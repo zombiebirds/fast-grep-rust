@@ -13,9 +13,12 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use crate::casefold;
-use crate::index::{Posting, SparseIndex, TrigramBuilder};
+use crate::index::{FollowerMask, Posting, SparseIndex, TrigramBuilder};
 use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
+
+/// On-disk mask entry size (8 × u32 little-endian = 256 bits).
+const MASK_ENTRY_SIZE: usize = 32;
 
 /// On-disk index format version. Bumped to 4 for the compact (delta-varint)
 /// posting format; the loader transparently migrates older indices by
@@ -192,6 +195,19 @@ pub struct PersistentIndex {
     pub bitmap_lookup_ci_count: usize,
     pub delta_lookup_ci: Vec<LookupEntry>,
     pub delta_postings_ci: Vec<u8>,
+    // Successor masks (Cursor phrase-aware trigram pre-filter). Optional —
+    // older indexes and indexes that opted out don't have them. When
+    // `masks_mmap` is `None`, `mask_overlap` returns true unconditionally
+    // (no pruning) so the searcher can be written as if masks were always
+    // present.
+    pub masks_mmap: Option<Mmap>,
+    pub masks_lookup_mmap: Option<Mmap>,
+    #[allow(dead_code)] // read by `lookup_mask`; the count lives in the struct for symmetry
+    pub masks_count: usize,
+    pub masks_ci_mmap: Option<Mmap>,
+    pub masks_ci_lookup_mmap: Option<Mmap>,
+    #[allow(dead_code)]
+    pub masks_ci_count: usize,
 }
 
 impl PersistentIndex {
@@ -237,6 +253,12 @@ impl PersistentIndex {
         if self.bitmap_lookup_mmap.is_some() {
             self.bitmap_lookup_mmap = Some(empty_mmap());
         }
+        if self.masks_mmap.is_some() {
+            self.masks_mmap = Some(empty_mmap());
+        }
+        if self.masks_lookup_mmap.is_some() {
+            self.masks_lookup_mmap = Some(empty_mmap());
+        }
         if self.lookup_ci_mmap.is_some() {
             self.lookup_ci_mmap = Some(empty_mmap());
         }
@@ -248,6 +270,12 @@ impl PersistentIndex {
         }
         if self.bitmap_lookup_ci_mmap.is_some() {
             self.bitmap_lookup_ci_mmap = Some(empty_mmap());
+        }
+        if self.masks_ci_mmap.is_some() {
+            self.masks_ci_mmap = Some(empty_mmap());
+        }
+        if self.masks_ci_lookup_mmap.is_some() {
+            self.masks_ci_lookup_mmap = Some(empty_mmap());
         }
     }
     pub fn doc_path(&self, id: u32) -> Option<&Path> {
@@ -349,6 +377,107 @@ impl PersistentIndex {
         } else {
             None
         }
+    }
+
+    // --- Successor-mask lookup (Tier 0.5: 4-byte pre-filter) ---
+    //
+    // The mask is a 256-bit (8 × u32 LE) bitmap per trigram stored
+    // verbatim in the order of the trigram list. The lookup table is the
+    // same shape as the postings lookup (hash → offset/len), so we
+    // reuse the binary-search helper. We never deserialize — a mask is
+    // just 8 u32 reads, so we return the borrowed `&[u32; 8]` slice and
+    // let the caller index into it.
+
+    /// Return the 8-word (256-bit) successor mask for `hash`, or `None` if
+    /// the trigram isn't present. When the index has no mask files (older
+    /// build, or migrated index), this also returns `None`.
+    #[inline]
+    #[allow(dead_code)] // exercised by the mask test target; not yet wired into search_timed
+    fn lookup_mask(&self, hash: u32, ci: bool) -> Option<FollowerMask> {
+        let (data, lookup, count) = if ci {
+            (
+                self.masks_ci_mmap.as_deref()?,
+                self.masks_ci_lookup_mmap.as_deref()?,
+                self.masks_ci_count,
+            )
+        } else {
+            (
+                self.masks_mmap.as_deref()?,
+                self.masks_lookup_mmap.as_deref()?,
+                self.masks_count,
+            )
+        };
+        let (offset, _len) = self.find_in_masks_lookup(hash, lookup, count)?;
+        let off = offset as usize;
+        // Each mask is exactly MASK_ENTRY_SIZE bytes (8 × u32 LE). Copy
+        // out into a stack-allocated FollowerMask — the cost (32 bytes
+        // per call) is in the noise next to the binary search that
+        // preceded it, and avoids needing an alignment proof for an
+        // unsafe slice cast through a fat pointer.
+        let bytes = &data[off..off + MASK_ENTRY_SIZE];
+        let mut out = [0u32; 8];
+        for (i, w) in out.iter_mut().enumerate() {
+            let b = i * 4;
+            *w = u32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]]);
+        }
+        Some(out)
+    }
+
+    /// Binary search in a mask lookup table. The layout mirrors
+    /// `find_in_main_lookup` (16-byte entries: hash, offset, len) but we
+    /// take the data + count explicitly so the same code services both
+    /// the CS and CI mask files.
+    #[inline]
+    #[allow(dead_code)]
+    fn find_in_masks_lookup(&self, hash: u32, data: &[u8], count: usize) -> Option<(u64, u32)> {
+        let mut lo = 0usize;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let h = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE);
+            match h.cmp(&hash) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => {
+                    let off = read_u64_le(data, mid * LOOKUP_ENTRY_SIZE + 4);
+                    let len = read_u32_le(data, mid * LOOKUP_ENTRY_SIZE + 12);
+                    return Some((off, len));
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns true when at least one byte in `allowed_bytes` is recorded
+    /// as a successor of the trigram identified by `hash` somewhere in
+    /// the corpus. This is the "4-byte query" half of the phrase-aware
+    /// trigram pre-filter: given a regex literal run, the searcher asks
+    /// "could this trigram plausibly be followed by any of the bytes the
+    /// regex requires next?" — if no, the alternative is provably empty
+    /// and can be skipped without touching the postings.
+    ///
+    /// The CI variant resolves against the case-folded companion mask;
+    /// pass `ci = true` when the query is `(?i)`.
+    ///
+    /// When the loaded index has no mask files (older version, or the
+    /// optional mask wasn't built), returns true unconditionally so the
+    /// searcher can use the API as if masks were always present.
+    #[inline]
+    #[allow(dead_code)] // exposed for the searcher to call; not yet wired in
+    pub fn mask_overlap(&self, hash: u32, allowed_bytes: &[u8], ci: bool) -> bool {
+        // No mask files → no pruning (preserves backward compatibility).
+        let mask = match self.lookup_mask(hash, ci) {
+            Some(m) => m,
+            None => return true,
+        };
+        for &b in allowed_bytes {
+            let word = (b >> 5) as usize;
+            let bit = b & 0x1F;
+            if mask[word] & (1u32 << bit) != 0 {
+                return true;
+            }
+        }
+        false
     }
 
     // --- Roaring bitmap lookup (Tier 1) ---
@@ -814,15 +943,22 @@ impl PersistentIndex {
     }
 }
 
-/// Serialize one trigram map to its four on-disk files under `output`, named
+/// Serialize one trigram map to its six on-disk files under `output`, named
 /// `{prefix}.postings`, `{prefix}.lookup`, `{prefix}.bitmaps`,
-/// `{prefix}.bitmaps.lookup`. Used for both the case-sensitive map
-/// (`prefix = "ngrams"`) and the case-insensitive companion
-/// (`prefix = "ngrams.ci"`). Returns the postings byte length.
+/// `{prefix}.bitmaps.lookup`, `{prefix}.masks`, `{prefix}.masks.lookup`.
+/// Used for both the case-sensitive map (`prefix = "ngrams"`) and the
+/// case-insensitive companion (`prefix = "ngrams.ci"`). Returns the
+/// postings byte length.
+///
+/// `masks` is the corpus-level successor mask built alongside `ngrams` in
+/// the indexing pass. Each mask entry is a fixed 256-bit (8 × u32) bitmap
+/// written verbatim in the order of the trigram list, so the lookup table
+/// can be shared with the postings lookup (same hash → same row).
 fn write_ngram_files(
     output: &Path,
     prefix: &str,
     ngrams: &HashMap<[u8; 3], TrigramBuilder>,
+    masks: &HashMap<[u8; 3], FollowerMask>,
 ) -> Result<u64> {
     // Sort trigrams by hash for binary search
     let mut trigram_list: Vec<(&[u8; 3], &TrigramBuilder)> = ngrams.iter().collect();
@@ -881,6 +1017,40 @@ fn write_ngram_files(
     }
     bm_lookup_file.flush()?;
 
+    // Write successor masks (Tier 0.5: 4-byte pre-filter). The mask is a
+    // fixed 32-byte (8 × u32 LE) entry per trigram in the same hash order
+    // as the postings. Trigrams with no recorded follower (no 4th byte in
+    // any file) are still emitted as a zero mask so the binary search
+    // stays aligned with the trigram list — this means a missing follower
+    // is represented as "all bits zero", which mask_overlap will report
+    // as "no overlap" with any non-empty allowed set. The lookup table
+    // mirrors the postings lookup (same hash) for symmetry with the rest
+    // of the format; a more compact representation could be devised if
+    // 32 bytes/trigram ever dominates the on-disk footprint.
+    let masks_path = output.join(format!("{prefix}.masks"));
+    let mut masks_file = BufWriter::new(File::create(&masks_path)?);
+    let mut mask_lookup_entries: Vec<(u32, u64, u32)> = Vec::new();
+    let mut mask_offset: u64 = 0;
+    let zero_mask: FollowerMask = [0u32; 8];
+    for (tri, _) in &trigram_list {
+        let mask = masks.get(*tri).unwrap_or(&zero_mask);
+        for word in mask {
+            masks_file.write_u32::<LittleEndian>(*word)?;
+        }
+        mask_lookup_entries.push((crc32fast::hash(*tri), mask_offset, MASK_ENTRY_SIZE as u32));
+        mask_offset += MASK_ENTRY_SIZE as u64;
+    }
+    masks_file.flush()?;
+
+    let masks_lookup_path = output.join(format!("{prefix}.masks.lookup"));
+    let mut mask_lookup_file = BufWriter::new(File::create(&masks_lookup_path)?);
+    for (hash, off, len) in &mask_lookup_entries {
+        mask_lookup_file.write_u32::<LittleEndian>(*hash)?;
+        mask_lookup_file.write_u64::<LittleEndian>(*off)?;
+        mask_lookup_file.write_u32::<LittleEndian>(*len)?;
+    }
+    mask_lookup_file.flush()?;
+
     Ok(postings_len)
 }
 
@@ -892,6 +1062,8 @@ fn remove_ci_files(output: &Path) {
         "ngrams.ci.lookup",
         "ngrams.ci.bitmaps",
         "ngrams.ci.bitmaps.lookup",
+        "ngrams.ci.masks",
+        "ngrams.ci.masks.lookup",
         "delta.ci.postings",
         "delta.ci.lookup",
     ] {
@@ -962,9 +1134,16 @@ fn write_index_files(
 ) -> Result<u64> {
     // Write the case-sensitive trigram files, and the case-insensitive
     // companion (`ngrams.ci.*`) when this is a CI build.
-    let postings_len = write_ngram_files(output, "ngrams", &index.ngrams)?;
+    let postings_len = write_ngram_files(output, "ngrams", &index.ngrams, &index.masks)?;
     if let Some(ci) = &index.ngrams_ci {
-        write_ngram_files(output, "ngrams.ci", ci)?;
+        // The CI mask is paired with the CI trigram map. `masks_ci` is
+        // always built lockstep with `ngrams_ci` inside `add_document`, so
+        // it must be `Some` here; the static empty map is only a fallback
+        // for defensive symmetry with the CS path.
+        static EMPTY: std::sync::OnceLock<HashMap<[u8; 3], crate::index::FollowerMask>> =
+            std::sync::OnceLock::new();
+        let ci_masks = index.masks_ci.as_ref().unwrap_or_else(|| EMPTY.get_or_init(HashMap::new));
+        write_ngram_files(output, "ngrams.ci", ci, ci_masks)?;
     } else {
         // A prior CI build over this directory may have left stale CI files.
         remove_ci_files(output);
@@ -1085,9 +1264,21 @@ fn write_delta_store(
     Ok(())
 }
 
-/// Open the four mmaps of a trigram store given its file prefix, returning
-/// `None` for the whole set when the postings file is absent.
-type StoreMmaps = (Mmap, usize, Mmap, Option<Mmap>, Option<Mmap>, usize);
+/// Open the eight mmaps of a trigram store given its file prefix, returning
+/// `None` for the whole set when the postings file is absent. The mask
+/// files are optional (older indices pre-date them); the corresponding
+/// `Option` fields are `None` when the files are missing.
+type StoreMmaps = (
+    Mmap,
+    usize,
+    Mmap,
+    Option<Mmap>,
+    Option<Mmap>,
+    usize,
+    Option<Mmap>,
+    Option<Mmap>,
+    usize,
+);
 fn load_store(index_path: &Path, prefix: &str) -> Result<Option<StoreMmaps>> {
     let postings_path = index_path.join(format!("{prefix}.postings"));
     if !postings_path.exists() {
@@ -1112,6 +1303,24 @@ fn load_store(index_path: &Path, prefix: &str) -> Result<Option<StoreMmaps>> {
         } else {
             (None, None, 0)
         };
+
+    // Successor-mask files: optional. When absent, mask_overlap returns
+    // true for every query (no pruning), so the searcher still works
+    // correctly on indexes built by older versions of `fgr`.
+    let masks_path = index_path.join(format!("{prefix}.masks"));
+    let masks_lookup_path = index_path.join(format!("{prefix}.masks.lookup"));
+    let (masks_mmap, masks_lookup_mmap, masks_count) =
+        if masks_path.exists() && masks_lookup_path.exists() {
+            let mf = File::open(&masks_path)?;
+            let mm = unsafe { Mmap::map(&mf)? };
+            let mlf = File::open(&masks_lookup_path)?;
+            let mlm = unsafe { Mmap::map(&mlf)? };
+            let count = mlm.len() / LOOKUP_ENTRY_SIZE;
+            (Some(mm), Some(mlm), count)
+        } else {
+            (None, None, 0)
+        };
+
     Ok(Some((
         lookup_mmap,
         lookup_count,
@@ -1119,6 +1328,9 @@ fn load_store(index_path: &Path, prefix: &str) -> Result<Option<StoreMmaps>> {
         bitmap_mmap,
         bitmap_lookup_mmap,
         bitmap_lookup_count,
+        masks_mmap,
+        masks_lookup_mmap,
+        masks_count,
     )))
 }
 
@@ -1189,6 +1401,23 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
             (None, None, 0)
         };
 
+    // Load case-sensitive successor mask files (optional — older indexes
+    // pre-date the mask). When absent, mask_overlap returns true (no
+    // pruning) and the search falls back to its existing two-tier path.
+    let masks_path = index_path.join("ngrams.masks");
+    let masks_lookup_path = index_path.join("ngrams.masks.lookup");
+    let (masks_mmap, masks_lookup_mmap, masks_count) =
+        if masks_path.exists() && masks_lookup_path.exists() {
+            let mf = File::open(&masks_path).context("opening ngrams.masks")?;
+            let mm = unsafe { Mmap::map(&mf)? };
+            let mlf = File::open(&masks_lookup_path).context("opening ngrams.masks.lookup")?;
+            let mlm = unsafe { Mmap::map(&mlf)? };
+            let count = mlm.len() / LOOKUP_ENTRY_SIZE;
+            (Some(mm), Some(mlm), count)
+        } else {
+            (None, None, 0)
+        };
+
     // Load main doc_ids via mmap (zero-alloc offset table)
     let docids_path = index_path.join("docids.bin");
     let docids_file = File::open(&docids_path).context("opening docids.bin")?;
@@ -1241,13 +1470,26 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         bitmap_ci_mmap,
         bitmap_lookup_ci_mmap,
         bitmap_lookup_ci_count,
+        masks_ci_mmap,
+        masks_ci_lookup_mmap,
+        masks_ci_count,
     ) = match if meta.case_insensitive {
         load_store(index_path, "ngrams.ci")?
     } else {
         None
     } {
-        Some((lm, lc, pm, bm, blm, bc)) => (Some(lm), lc, Some(pm), bm, blm, bc),
-        None => (None, 0, None, None, None, 0),
+        Some((lm, lc, pm, bm, blm, bc, mm, mlm, mc)) => (
+            Some(lm),
+            lc,
+            Some(pm),
+            bm,
+            blm,
+            bc,
+            mm,
+            mlm,
+            mc,
+        ),
+        None => (None, 0, None, None, None, 0, None, None, 0),
     };
     let (delta_lookup_ci, delta_postings_ci) = read_delta(
         &index_path.join("delta.ci.lookup"),
@@ -1294,6 +1536,12 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         bitmap_lookup_ci_count,
         delta_lookup_ci,
         delta_postings_ci,
+        masks_mmap,
+        masks_lookup_mmap,
+        masks_count,
+        masks_ci_mmap,
+        masks_ci_lookup_mmap,
+        masks_ci_count,
     })
 }
 
