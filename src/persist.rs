@@ -195,8 +195,61 @@ pub struct PersistentIndex {
 }
 
 impl PersistentIndex {
-    /// Resolve a doc_id to its file path (zero-alloc for main docs).
-    #[inline]
+    /// Release the memory-mapped files backing this index. After calling this,
+    /// none of the search methods are usable. Use this when you need to
+    /// overwrite or rename the index files on Windows, where the OS refuses
+    /// to truncate or rename a file that still has an active mapping. The
+    /// safe pattern is to call this immediately before `compact()` or any
+    /// other operation that writes to the index directory.
+    pub fn close(&mut self) {
+        // Replace each file-backed mapping with a mapping over a throwaway
+        // scratch file. Assigning to `self.lookup_mmap` (etc.) drops the prior
+        // `Mmap` first, which is what releases the OS section on Windows.
+        // The scratch files live in the system temp dir and are deleted
+        // immediately; we keep their file handles alive for the lifetime of
+        // the mmap by leaking them. (The OS reaps them when the process
+        // exits, by which point nothing in this index is in use anyway.)
+        fn empty_mmap() -> Mmap {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("fgr-empty-mmap-{}-{}.bin", std::process::id(), n));
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("create scratch mmap file");
+            f.set_len(1).expect("set scratch length");
+            let _ = std::fs::remove_file(&path);
+            let mmap = unsafe { Mmap::map(&f).expect("mmap scratch file") };
+            std::mem::forget(f);
+            mmap
+        }
+
+        self.lookup_mmap = empty_mmap();
+        self.postings_mmap = empty_mmap();
+        self.docids_mmap = empty_mmap();
+        if self.bitmap_mmap.is_some() {
+            self.bitmap_mmap = Some(empty_mmap());
+        }
+        if self.bitmap_lookup_mmap.is_some() {
+            self.bitmap_lookup_mmap = Some(empty_mmap());
+        }
+        if self.lookup_ci_mmap.is_some() {
+            self.lookup_ci_mmap = Some(empty_mmap());
+        }
+        if self.postings_ci_mmap.is_some() {
+            self.postings_ci_mmap = Some(empty_mmap());
+        }
+        if self.bitmap_ci_mmap.is_some() {
+            self.bitmap_ci_mmap = Some(empty_mmap());
+        }
+        if self.bitmap_lookup_ci_mmap.is_some() {
+            self.bitmap_lookup_ci_mmap = Some(empty_mmap());
+        }
+    }
     pub fn doc_path(&self, id: u32) -> Option<&Path> {
         let id = id as usize;
         if id < self.docid_offsets.len() {
@@ -874,6 +927,39 @@ pub fn build(
     // Collect directory mtimes for fast stale detection
     let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
+    let postings_len = write_index_files(output, &index, root, file_mtimes, dir_mtimes)?;
+
+    // Clean up any delta files and stale lock from previous runs
+    let _ = fs::remove_file(output.join("lock"));
+
+    if verbose {
+        eprintln!(
+            "Index built: {} docs, {} trigrams, postings {}KB{}",
+            index.doc_ids.len(),
+            index.ngrams.len(),
+            postings_len / 1024,
+            if index.ngrams_ci.is_some() {
+                " (+ case-insensitive index)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    Ok(())
+}
+
+/// Serialize a fully-built `SparseIndex` to disk under `output`, writing the
+/// trigram store, optional CI companion, docids table, and `meta.json`. Also
+/// removes any stale delta + lock files from a prior incremental run so the
+/// directory describes a single, self-contained main index.
+fn write_index_files(
+    output: &Path,
+    index: &SparseIndex,
+    root: &Path,
+    file_mtimes: HashMap<String, u64>,
+    dir_mtimes: HashMap<String, u64>,
+) -> Result<u64> {
     // Write the case-sensitive trigram files, and the case-insensitive
     // companion (`ngrams.ci.*`) when this is a CI build.
     let postings_len = write_ngram_files(output, "ngrams", &index.ngrams)?;
@@ -912,29 +998,16 @@ pub fn build(
     let meta_json = serde_json::to_string_pretty(&meta)?;
     fs::write(&meta_path, meta_json)?;
 
-    // Clean up any delta files and stale lock from previous runs
+    // Old bitmap files are overwritten by the new ones above; delta files
+    // and lock are cleared so the directory describes a clean main index.
     let _ = fs::remove_file(output.join("delta.postings"));
     let _ = fs::remove_file(output.join("delta.lookup"));
     let _ = fs::remove_file(output.join("delta.docids"));
     let _ = fs::remove_file(output.join("deleted.bin"));
-    let _ = fs::remove_file(output.join("lock"));
-    // Old bitmap files are overwritten by the new ones above
+    let _ = fs::remove_file(output.join("delta.ci.postings"));
+    let _ = fs::remove_file(output.join("delta.ci.lookup"));
 
-    if verbose {
-        eprintln!(
-            "Index built: {} docs, {} trigrams, postings {}KB{}",
-            meta.num_docs,
-            meta.num_ngrams,
-            postings_len / 1024,
-            if meta.case_insensitive {
-                " (+ case-insensitive index)"
-            } else {
-                ""
-            }
-        );
-    }
-
-    Ok(())
+    Ok(postings_len)
 }
 
 /// True if an index exists at `idx_path` and is the current on-disk format
@@ -1203,6 +1276,116 @@ pub struct UpdateStats {
     pub deleted: usize,
     pub unchanged: usize,
     pub duration_ms: u64,
+}
+
+pub struct CompactStats {
+    pub before_main: usize,
+    pub before_delta: usize,
+    pub deleted_reclaimed: usize,
+    pub after_total: usize,
+    pub duration_ms: u64,
+}
+
+/// Merge the in-memory delta (delta_postings + delta_lookup + delta_docids +
+/// deleted_docs) back into a fresh main index file. After a successful compact
+/// the index directory describes a self-contained main index with no delta
+/// overlay; `meta.main_num_docs` becomes the new doc count.
+///
+/// `verbose` prints indexing progress.
+///
+/// Use this after a long sequence of incremental updates so the search hot
+/// path (which has to filter out deleted docs and merge with delta on every
+/// query) is back to a single-mmap lookup.
+pub fn compact(index_path: &Path, verbose: bool) -> Result<CompactStats> {
+    let start = Instant::now();
+
+    // 1. Load the persistent index to learn the merged doc_ids, root_dir, and
+    //    whether a case-insensitive companion is in use.
+    let mut pidx = load(index_path)?;
+
+    let root_dir = pidx.meta.root_dir.clone();
+    let ci_enabled = pidx.has_ci();
+    let before_main = pidx.main_num_docs;
+    let before_delta = pidx.num_docs() - pidx.main_num_docs;
+
+    // 2. Effective doc_ids = main (minus deleted) ∪ delta. Main docs come
+    //    first so any future incremental update appends to a stable range.
+    let mut effective_paths: Vec<PathBuf> = Vec::with_capacity(pidx.num_docs());
+    let mut deleted_reclaimed = 0usize;
+    for id in 0..pidx.main_num_docs as u32 {
+        if pidx.deleted_docs.contains(&id) {
+            deleted_reclaimed += 1;
+            continue;
+        }
+        if let Some(path) = pidx.doc_path(id) {
+            effective_paths.push(path.to_path_buf());
+        }
+    }
+    for id in pidx.main_num_docs as u32..pidx.num_docs() as u32 {
+        if let Some(path) = pidx.doc_path(id) {
+            effective_paths.push(path.to_path_buf());
+        }
+    }
+
+    // Release the mmaps before rewriting the index files. Windows refuses to
+    // truncate a file that still has an active mapping (os error 1224).
+    pidx.close();
+    drop(pidx);
+
+    // 3. Acquire the index lock so a concurrent `update_incremental` can't
+    //    clobber our rewrite of the main files. The lock is released on drop
+    //    of the file handle at end of scope.
+    let (_lock, _waited) = acquire_index_lock(index_path)
+        .context("acquiring index lock for compact")?;
+
+    if verbose {
+        eprintln!(
+            "Compacting index at {}: {} main + {} delta → rewriting as fresh main index",
+            index_path.display(),
+            before_main,
+            before_delta,
+        );
+    }
+
+    // 4. Reindex the effective file list (skips the directory walk — we
+    //    already know exactly which files belong to the corpus).
+    let index = SparseIndex::build_from_paths(&effective_paths, ci_enabled, verbose)?;
+
+    // 5. Refresh mtime caches: every file we're now indexing should carry its
+    //    current mtime, and we don't trust stale ones.
+    let mut file_mtimes = HashMap::with_capacity(index.doc_ids.len());
+    for path in &index.doc_ids {
+        if let Ok(m) = fs::metadata(path) {
+            file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
+        }
+    }
+    let dir_mtimes = collect_dir_mtimes(Path::new(&root_dir), false, Some(index_path));
+
+    // 6. Write the fresh main index files (overwrites existing ngrams.* and
+    //    docids.bin, then clears delta + deleted + lock).
+    let root = Path::new(&root_dir);
+    write_index_files(index_path, &index, root, file_mtimes, dir_mtimes)?;
+
+    let after_total = index.doc_ids.len();
+
+    if verbose {
+        eprintln!(
+            "Compact done: {} docs (was {} + {} delta, {} deleted reclaimed) in {}ms",
+            after_total,
+            before_main,
+            before_delta,
+            deleted_reclaimed,
+            start.elapsed().as_millis(),
+        );
+    }
+
+    Ok(CompactStats {
+        before_main,
+        before_delta,
+        deleted_reclaimed,
+        after_total,
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Result<UpdateStats> {

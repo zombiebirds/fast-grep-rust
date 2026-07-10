@@ -180,43 +180,19 @@ impl SparseIndex {
         }
     }
 
-    pub fn build_from_directory(
-        root: &Path,
-        no_ignore: bool,
-        type_filter: &[String],
-        verbose: bool,
+    /// Build an index from a pre-collected list of paths. Skips the directory
+    /// walk that `build_from_directory` performs; used by `compact` to reindex
+    /// from the persistent index's known doc_ids without re-scanning the tree.
+    pub fn build_from_paths(
+        paths: &[PathBuf],
         case_insensitive: bool,
+        verbose: bool,
     ) -> Result<Self> {
         use rayon::prelude::*;
 
-        // Phase 1: collect all file paths (serial; the walker is I/O bound
-        // already and the path Vec is small relative to file contents).
-        let walker = WalkBuilder::new(root)
-            .git_ignore(!no_ignore)
-            .hidden(false)
-            .build();
-
-        let mut paths: Vec<PathBuf> = Vec::new();
-        for entry in walker {
-            let entry = entry?;
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-
-            if !crate::searcher::passes_type_filter(path, type_filter) {
-                continue;
-            }
-
-            paths.push(path.to_path_buf());
-        }
-
-        // Phase 2: read files in parallel, in bounded chunks. Chunking caps
-        // peak memory so we don't pin the whole corpus content simultaneously
-        // while still overlapping many `read()` syscalls across threads.
-        const CHUNK_FILES: usize = 1024;
         let mut index = SparseIndex::with_capacity(paths.len(), case_insensitive);
         let mut count = 0u32;
+        const CHUNK_FILES: usize = 1024;
         for chunk_start in (0..paths.len()).step_by(CHUNK_FILES) {
             let chunk_end = (chunk_start + CHUNK_FILES).min(paths.len());
             let chunk = &paths[chunk_start..chunk_end];
@@ -227,11 +203,6 @@ impl SparseIndex {
                     let content = std::fs::read(path).ok()?;
                     // Match `search_full_scan`'s binary-detection rule so the
                     // indexed and direct-scan paths see the same set of files.
-                    // Known text extensions (`.txt`, `.rs`, etc.) trust the
-                    // extension and bypass the null-byte heuristic — fixtures
-                    // can legitimately contain `\0` and we don't want to drop
-                    // them from the index when the direct scan would still
-                    // search them.
                     if !is_known_text_ext(path) && content.iter().take(512).any(|&b| b == 0) {
                         return None;
                     }
@@ -259,6 +230,39 @@ impl SparseIndex {
         }
 
         Ok(index)
+    }
+
+    pub fn build_from_directory(
+        root: &Path,
+        no_ignore: bool,
+        type_filter: &[String],
+        verbose: bool,
+        case_insensitive: bool,
+    ) -> Result<Self> {
+        // Phase 1: collect all file paths (serial; the walker is I/O bound
+        // already and the path Vec is small relative to file contents).
+        let walker = WalkBuilder::new(root)
+            .git_ignore(!no_ignore)
+            .hidden(false)
+            .build();
+
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in walker {
+            let entry = entry?;
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+
+            if !crate::searcher::passes_type_filter(path, type_filter) {
+                continue;
+            }
+
+            paths.push(path.to_path_buf());
+        }
+
+        // Phase 2: read in parallel chunks (see `build_from_paths`).
+        Self::build_from_paths(&paths, case_insensitive, verbose)
     }
 }
 

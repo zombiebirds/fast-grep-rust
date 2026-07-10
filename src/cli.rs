@@ -242,6 +242,13 @@ pub enum Commands {
         #[arg(long, default_value = ".fgr")]
         index: PathBuf,
     },
+    /// Merge the in-memory delta back into the main index, freeing deleted
+    /// docs from the search hot path.
+    #[command(name = "compact")]
+    Compact {
+        #[arg(long, default_value = ".fgr")]
+        index: PathBuf,
+    },
     /// Watch DIR for changes and keep index up-to-date
     #[command(name = "daemon")]
     Daemon {
@@ -826,6 +833,17 @@ fn run_subcommand(
                 );
                 println!("  Avg postings len: {:.1}", stats.avg_postings_len);
             }
+        }
+        Commands::Compact { index: idx_path } => {
+            let stats = persist::compact(&idx_path, true)?;
+            eprintln!(
+                "Compacted: {} main + {} delta ({} deleted) → {} docs in {}ms",
+                stats.before_main,
+                stats.before_delta,
+                stats.deleted_reclaimed,
+                stats.after_total,
+                stats.duration_ms,
+            );
         }
         #[cfg(feature = "daemon")]
         Commands::Daemon { action } => match action {
