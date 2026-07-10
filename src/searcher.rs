@@ -666,11 +666,37 @@ fn line_bounds(buf: &[u8], offset: usize) -> (usize, usize) {
     (line_start, line_end)
 }
 
-/// Check if buffer looks binary (null byte in first 512 bytes).
+/// Check if buffer looks binary. Two-stage heuristic:
+///   1. NUL byte in the first 512 bytes — catches UTF-16, ELF, images,
+///      archives, anything with NUL padding. Cheap SIMD memchr scan.
+///   2. If no NUL was found, sample the first 8 KB and check whether the
+///      non-text byte ratio exceeds 30 %. Catches binary formats that
+///      happen to avoid NUL in the head (PDFs without an early NUL,
+///      some compressed formats, binary logs). Same threshold ripgrep uses.
+///
+/// Known text extensions (`.txt`, `.rs`, …) bypass this entirely — see
+/// `is_known_text_ext`.
 #[inline]
 pub(crate) fn is_binary(buf: &[u8]) -> bool {
-    let check_len = buf.len().min(512);
-    memchr::memchr(0, &buf[..check_len]).is_some()
+    // Stage 1: NUL-byte short-circuit (fast SIMD path).
+    let head_len = buf.len().min(512);
+    if memchr::memchr(0, &buf[..head_len]).is_some() {
+        return true;
+    }
+
+    // Stage 2: control-char ratio over a larger sample.
+    let sample_len = buf.len().min(8192);
+    if sample_len == 0 {
+        return false;
+    }
+    let mut non_text = 0usize;
+    for &b in &buf[..sample_len] {
+        // Control characters except tab/newline/CR, plus DEL.
+        if (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7f {
+            non_text += 1;
+        }
+    }
+    non_text * 100 > sample_len * 30
 }
 
 /// Known text extensions — skip binary check for these (major perf win)
