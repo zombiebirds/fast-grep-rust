@@ -18,9 +18,9 @@ use crate::postenc::{PostingReader, PostingWriter};
 use crate::trigram;
 
 /// On-disk index format version. Bumped to 4 for the compact (delta-varint)
-/// posting format; the loader rejects older indices so they get rebuilt rather
-/// than decoded with the wrong reader.
-const INDEX_VERSION: u32 = 4;
+/// posting format; the loader transparently migrates older indices by
+/// rebuilding from the recorded `root_dir`.
+pub const INDEX_VERSION: u32 = 4;
 
 // --- Zero-copy read helpers ---
 
@@ -1128,12 +1128,39 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
 
     if meta.version != INDEX_VERSION {
-        anyhow::bail!(
-            "index at {} is version {} but this build expects version {} (posting format changed); rebuild with `fgr index`",
+        // Auto-migrate: an older index format can't be read by the v4
+        // delta-varint decoder, so rebuild from the root the previous index
+        // covered. The build() call reuses the recorded root_dir and
+        // case_insensitive flag, preserving the user's intent (the build is
+        // the migration — there's no per-format converter worth maintaining).
+        // We refuse to migrate when the meta has no root_dir, which can
+        // happen on partial/broken indices, and ask the caller to rebuild.
+        if meta.root_dir.is_empty() {
+            anyhow::bail!(
+                "index at {} is version {} but this build expects version {} and has no root_dir recorded; rebuild with `fgr index`",
+                index_path.display(),
+                meta.version,
+                INDEX_VERSION
+            );
+        }
+        eprintln!(
+            "[fgr] Migrating index at {} from version {} to {} (rebuilding)",
             index_path.display(),
             meta.version,
             INDEX_VERSION
         );
+        let root = Path::new(&meta.root_dir);
+        let ci = meta.case_insensitive;
+        // Clear the index directory before the rebuild so the directory walk
+        // (which may not be filtered by .gitignore on every system) doesn't
+        // index its own .postings/.lookup files as if they were sources.
+        let _ = fs::remove_dir_all(index_path);
+        build(root, index_path, false, &[], false, ci)
+            .context("auto-migrating older index")?;
+        // Recurse into the freshly-built v4 index. Recursion is bounded:
+        // build() writes the current INDEX_VERSION, so the recursive call
+        // passes the version check and returns immediately.
+        return load(index_path);
     }
 
     // Load main lookup via mmap (zero-copy binary search)
@@ -1396,15 +1423,39 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
     let meta_str = fs::read_to_string(&meta_path).context("reading meta.json")?;
     let meta: IndexMeta = serde_json::from_str(&meta_str).context("parsing meta.json")?;
     // An incremental update only rewrites the delta; it cannot mix a new-format
-    // delta into an old-format main index without corrupting it. Refuse on a
-    // version mismatch — the caller (or the search auto-build) rebuilds instead.
+    // delta into an old-format main index without corrupting it. Rebuild from
+    // scratch instead — `build()` writes the current version, after which
+    // the caller can re-run the update.
     if meta.version != INDEX_VERSION {
-        anyhow::bail!(
-            "index at {} is version {} but this build expects version {}; run `fgr index` to rebuild",
-            index_path.display(),
-            meta.version,
-            INDEX_VERSION
+        if meta.root_dir.is_empty() {
+            anyhow::bail!(
+                "index at {} is version {} but this build expects version {} and has no root_dir recorded; rebuild with `fgr index`",
+                index_path.display(),
+                meta.version,
+                INDEX_VERSION
+            );
+        }
+        eprintln!(
+            "[fgr] Index version mismatch on update; rebuilding from {:?} before continuing",
+            meta.root_dir
         );
+        let root = Path::new(&meta.root_dir);
+        let ci = meta.case_insensitive;
+        // See the matching note in load() — wipe the index dir first so the
+        // rebuild walk doesn't index its own files.
+        let _ = fs::remove_dir_all(index_path);
+        build(root, index_path, false, &[], false, ci)
+            .context("auto-migrating older index before update")?;
+        // After the rebuild there's nothing to incrementally update — the
+        // rebuild already re-walked the whole tree. Return an empty stats
+        // record so the caller knows no delta was applied.
+        return Ok(UpdateStats {
+            added: 0,
+            modified: 0,
+            deleted: 0,
+            unchanged: meta.num_docs,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
     }
     let saved_mtimes = meta.file_mtimes;
     let main_num_docs = meta.main_num_docs.unwrap_or(meta.num_docs);
