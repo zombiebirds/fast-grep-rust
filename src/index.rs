@@ -187,7 +187,10 @@ impl SparseIndex {
         verbose: bool,
         case_insensitive: bool,
     ) -> Result<Self> {
-        // Phase 1: collect all file paths
+        use rayon::prelude::*;
+
+        // Phase 1: collect all file paths (serial; the walker is I/O bound
+        // already and the path Vec is small relative to file contents).
         let walker = WalkBuilder::new(root)
             .git_ignore(!no_ignore)
             .hidden(false)
@@ -208,29 +211,42 @@ impl SparseIndex {
             paths.push(path.to_path_buf());
         }
 
-        // Phase 2: index all files
+        // Phase 2: read files in parallel, in bounded chunks. Chunking caps
+        // peak memory so we don't pin the whole corpus content simultaneously
+        // while still overlapping many `read()` syscalls across threads.
+        const CHUNK_FILES: usize = 1024;
         let mut index = SparseIndex::with_capacity(paths.len(), case_insensitive);
         let mut count = 0u32;
-        for path in &paths {
-            let content = match std::fs::read(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            // Match `search_full_scan`'s binary-detection rule so the
-            // indexed and direct-scan paths see the same set of files.
-            // Known text extensions (`.txt`, `.rs`, etc.) trust the
-            // extension and bypass the null-byte heuristic — fixtures
-            // can legitimately contain `\0` and we don't want to drop
-            // them from the index when the direct scan would still
-            // search them.
-            if !is_known_text_ext(path) && content.iter().take(512).any(|&b| b == 0) {
-                continue;
-            }
+        for chunk_start in (0..paths.len()).step_by(CHUNK_FILES) {
+            let chunk_end = (chunk_start + CHUNK_FILES).min(paths.len());
+            let chunk = &paths[chunk_start..chunk_end];
 
-            index.add_document(path, &content);
-            count += 1;
-            if verbose && count % 10000 == 0 {
-                eprintln!("  indexed {} files...", count);
+            let chunk_contents: Vec<Option<Vec<u8>>> = chunk
+                .par_iter()
+                .map(|path| -> Option<Vec<u8>> {
+                    let content = std::fs::read(path).ok()?;
+                    // Match `search_full_scan`'s binary-detection rule so the
+                    // indexed and direct-scan paths see the same set of files.
+                    // Known text extensions (`.txt`, `.rs`, etc.) trust the
+                    // extension and bypass the null-byte heuristic — fixtures
+                    // can legitimately contain `\0` and we don't want to drop
+                    // them from the index when the direct scan would still
+                    // search them.
+                    if !is_known_text_ext(path) && content.iter().take(512).any(|&b| b == 0) {
+                        return None;
+                    }
+                    Some(content)
+                })
+                .collect();
+
+            for (path, content) in chunk.iter().zip(chunk_contents.into_iter()) {
+                if let Some(content) = content {
+                    index.add_document(path, &content);
+                    count += 1;
+                    if verbose && count % 10000 == 0 {
+                        eprintln!("  indexed {} files...", count);
+                    }
+                }
             }
         }
 
