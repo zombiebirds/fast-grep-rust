@@ -11,6 +11,10 @@ use notify::{RecursiveMode, Watcher};
 use crate::persist;
 
 const DEBOUNCE_SECS: u64 = 3;
+/// Run a delta compaction after this many incremental updates so the search
+/// hot path stops paying for the deleted-doc filter + delta merge on every
+/// query. Override via the `FGR_COMPACT_EVERY` env var.
+const COMPACT_EVERY_UPDATES: u32 = 20;
 const PID_FILE: &str = "daemon.pid";
 const PORT_FILE: &str = "daemon.port";
 
@@ -26,6 +30,12 @@ struct Daemon {
     dirty: bool,
     pending_changes: HashSet<PathBuf>,
     last_event_time: Instant,
+    /// Number of incremental updates since the last compaction. When this
+    /// reaches `compact_threshold` the daemon runs a delta compaction so
+    /// the deleted-doc filter doesn't grow unboundedly across long editing
+    /// sessions.
+    updates_since_compact: u32,
+    compact_threshold: u32,
 }
 
 // --- PID/port file management ---
@@ -122,6 +132,35 @@ impl Daemon {
             eprintln!(
                 "[daemon] Updated index: +{} added, {} modified, {} deleted in {}ms",
                 stats.added, stats.modified, stats.deleted, stats.duration_ms
+            );
+            self.updates_since_compact = self.updates_since_compact.saturating_add(1);
+        }
+        // Auto-compact when the threshold is reached. The daemon doesn't
+        // hold a PersistentIndex across the event loop, so no mmap is in
+        // flight when compact() closes its own and rewrites the files.
+        if self.updates_since_compact >= self.compact_threshold {
+            if let Err(e) = self.run_compact() {
+                eprintln!("[daemon] Auto-compact failed: {}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a delta compaction: rewrite the main index files from the merged
+    /// (main + delta - deleted) doc set, then clear the overlay. Called both
+    /// from the auto-compact threshold and the `compact` socket command.
+    fn run_compact(&mut self) -> Result<()> {
+        let (_lock, _waited) = persist::acquire_index_lock(&self.index_path)?;
+        let stats = persist::compact(&self.index_path, false)?;
+        persist::release_index_lock(&self.index_path);
+        self.updates_since_compact = 0;
+        if stats.before_delta > 0 || stats.deleted_reclaimed > 0 {
+            eprintln!(
+                "[daemon] Compacted: reclaimed {} deleted, merged {} delta → {} docs in {}ms",
+                stats.deleted_reclaimed,
+                stats.before_delta,
+                stats.after_total,
+                stats.duration_ms,
             );
         }
         Ok(())
@@ -221,12 +260,20 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
     })
     .context("setting Ctrl+C handler")?;
 
+    let compact_threshold = std::env::var("FGR_COMPACT_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(COMPACT_EVERY_UPDATES);
+
     let mut daemon = Daemon {
         index_path: index_path.to_path_buf(),
         root_dir,
         dirty: false,
         pending_changes: HashSet::new(),
         last_event_time: Instant::now(),
+        updates_since_compact: 0,
+        compact_threshold,
     };
 
     eprintln!("[daemon] Ready, listening for events...");
@@ -270,6 +317,17 @@ pub fn start_daemon(index_path: &Path) -> Result<()> {
                                 eprintln!("[daemon] Update error: {}", e);
                             }
                             let _ = writeln!(writer, "ready");
+                            let _ = writer.flush();
+                        }
+                        "compact" => {
+                            match daemon.run_compact() {
+                                Ok(()) => {
+                                    let _ = writeln!(writer, "compacted");
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(writer, "error: {}", e);
+                                }
+                            }
                             let _ = writer.flush();
                         }
                         "stop" => {
