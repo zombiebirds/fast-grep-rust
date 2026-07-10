@@ -24,7 +24,6 @@ pub type Posting = (u32, u32, u32);
 /// (delta-varint) wire format. Postings are encoded into `bytes` as they are
 /// added, so the build never materializes the decoded `Vec<Posting>` for the
 /// whole corpus — that is what keeps the peak RAM near the on-disk size.
-#[derive(Default)]
 pub struct TrigramBuilder {
     /// Compact-encoded postings, ready to be written to `ngrams.postings`
     /// verbatim at serialize time.
@@ -33,6 +32,19 @@ pub struct TrigramBuilder {
     writer: PostingWriter,
     /// Number of postings encoded, for `stats()` / `avg_postings_len`.
     count: u32,
+}
+
+impl Default for TrigramBuilder {
+    fn default() -> Self {
+        // Pre-size the posting buffer so the common-case trigram (a few
+        // dozen postings) never reallocates during the build. 256 bytes
+        // covers ~80 same-doc postings in the compact wire format.
+        Self {
+            bytes: Vec::with_capacity(256),
+            writer: PostingWriter::new(),
+            count: 0,
+        }
+    }
 }
 
 pub struct SparseIndex {
@@ -49,6 +61,7 @@ pub struct SparseIndex {
 impl SparseIndex {
     /// Create an index; when `case_insensitive` is set it also accumulates the
     /// case-folded (CI) trigram map alongside the case-sensitive one.
+    #[allow(dead_code)] // exercised by the in-module unit tests; the bin target has no direct callers.
     pub fn with_case_insensitive(case_insensitive: bool) -> Self {
         SparseIndex {
             ngrams: HashMap::new(),
@@ -58,6 +71,23 @@ impl SparseIndex {
                 None
             },
             doc_ids: Vec::new(),
+        }
+    }
+
+    /// Create an index pre-sized for a corpus of roughly `path_count` files.
+    /// Sized to roughly `path_count * 64` entries: code corpora typically see
+    /// a few hundred unique trigrams per file, but the cap stops the map from
+    /// ballooning past useful on synthetic benchmarks with extreme reuse.
+    pub fn with_capacity(path_count: usize, case_insensitive: bool) -> Self {
+        let cap = path_count.saturating_mul(64).max(8192);
+        SparseIndex {
+            ngrams: HashMap::with_capacity(cap),
+            ngrams_ci: if case_insensitive {
+                Some(HashMap::with_capacity(cap))
+            } else {
+                None
+            },
+            doc_ids: Vec::with_capacity(path_count),
         }
     }
 
@@ -179,7 +209,7 @@ impl SparseIndex {
         }
 
         // Phase 2: index all files
-        let mut index = SparseIndex::with_case_insensitive(case_insensitive);
+        let mut index = SparseIndex::with_capacity(paths.len(), case_insensitive);
         let mut count = 0u32;
         for path in &paths {
             let content = match std::fs::read(path) {
