@@ -37,7 +37,6 @@ rayon = "1"
 roaring = "0.10"
 memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
-walkdir = "2"
 ignore = "0.4"
 crc32fast = "1"
 byteorder = "1"
