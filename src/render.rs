@@ -314,18 +314,11 @@ pub fn search_full_scan_render<W: Write + Send>(
 
 /// Render path for the persistent-index search. Resolves candidate files
 /// via the index (bitmap, line-level, or fallback) and renders each one
-/// through `render_file_into`. The line-level optimisation that the
-/// pre-render path used (jump to candidate offsets, skip the rest of the
-/// file) is currently not preserved — see TODO below — so for very
-/// low-density patterns the indexed path now reads the full content of
-/// each candidate file. The bitmap-level filtering still excludes
-/// non-candidate files, so the outer loop is still bounded by index
-/// selectivity.
-///
-/// TODO: for `SearchResult::LineHits` with `ctx.is_zero()`, restoring the
-/// jump-to-offset path would skip whole-file iteration. Worth doing when
-/// the regression shows up in benchmarks; skipped for v1 to keep one
-/// formatting code path.
+/// through `render_file_into`. For `LineHits` with zero context (and
+/// non-inverted output) we skip whole-file iteration: the index already
+/// pinpoints the exact candidate byte offsets, so we jump to each one
+/// and emit only the candidate lines. Falls back to the whole-file
+/// renderer for the bitmap/fallback paths and for non-zero context.
 pub fn search_persistent_render<W: Write + Send>(
     index: &crate::persist::PersistentIndex,
     pattern: &str,
@@ -347,30 +340,69 @@ pub fn search_persistent_render<W: Write + Send>(
     let (result, mut timing) = index.search_timed(pattern);
     let t_verify = std::time::Instant::now();
 
-    // Collect candidate file paths (index-internal references).
-    let candidate_paths: Vec<&Path> = match result {
-        SearchResult::LineHits(hits) => {
-            let mut paths: Vec<&Path> = hits.iter().map(|h| h.path).collect();
-            paths.sort();
-            paths.dedup();
-            paths
-        }
-        SearchResult::BitmapFiles(paths) | SearchResult::AllFiles(paths) => paths,
-    };
+    // For LineHits with zero context and non-inverted output we can jump
+    // straight to each candidate offset — skip scanning the whole file.
+    let use_indexed_path = matches!(result, SearchResult::LineHits(_))
+        && ctx.is_zero()
+        && !render.invert;
 
-    // Apply hidden + path filter + glob overrides + type filter. Same
-    // post-lookup filtering pattern; the indexed path can't push these
-    // down into the trigram lookup so we do them in one pass after.
-    let candidate_paths: Vec<PathBuf> = candidate_paths
-        .into_iter()
-        .filter(|p| {
-            (hidden || !crate::searcher::is_hidden_path(p, &index_root))
-                && path_filter.map_or(true, |f| p.starts_with(f))
-                && crate::searcher::passes_overrides(p, ov.as_ref())
-                && crate::searcher::passes_type_filter(p, type_filter)
-        })
-        .map(|p| p.to_path_buf())
-        .collect();
+    let indexed_hits_by_file: std::collections::HashMap<PathBuf, Vec<(u32, u32)>> =
+        if use_indexed_path {
+            if let SearchResult::LineHits(hits) = &result {
+                let mut grouped: std::collections::HashMap<PathBuf, Vec<(u32, u32)>> =
+                    std::collections::HashMap::new();
+                for h in hits {
+                    if !hidden && crate::searcher::is_hidden_path(h.path, &index_root) {
+                        continue;
+                    }
+                    if let Some(filter) = path_filter {
+                        if !h.path.starts_with(filter) {
+                            continue;
+                        }
+                    }
+                    if !crate::searcher::passes_overrides(h.path, ov.as_ref()) {
+                        continue;
+                    }
+                    if !crate::searcher::passes_type_filter(h.path, type_filter) {
+                        continue;
+                    }
+                    grouped
+                        .entry(h.path.to_path_buf())
+                        .or_default()
+                        .push((h.line_no, h.byte_offset));
+                }
+                grouped
+            } else {
+                std::collections::HashMap::new()
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    // For non-indexed paths, collect unique candidate paths to render in full.
+    let candidate_paths: Vec<PathBuf> = if use_indexed_path {
+        indexed_hits_by_file.keys().cloned().collect()
+    } else {
+        let paths: Vec<&Path> = match &result {
+            SearchResult::LineHits(hits) => {
+                let mut paths: Vec<&Path> = hits.iter().map(|h| h.path).collect();
+                paths.sort();
+                paths.dedup();
+                paths
+            }
+            SearchResult::BitmapFiles(paths) | SearchResult::AllFiles(paths) => paths.clone(),
+        };
+        paths
+            .into_iter()
+            .filter(|p| {
+                (hidden || !crate::searcher::is_hidden_path(p, &index_root))
+                    && path_filter.map_or(true, |f| p.starts_with(f))
+                    && crate::searcher::passes_overrides(p, ov.as_ref())
+                    && crate::searcher::passes_type_filter(p, type_filter)
+            })
+            .map(|p| p.to_path_buf())
+            .collect()
+    };
 
     let total_count = std::sync::atomic::AtomicUsize::new(0);
     let collector: Mutex<Vec<(PathBuf, Vec<u8>)>> = Mutex::new(Vec::new());
@@ -390,7 +422,12 @@ pub fn search_persistent_render<W: Write + Send>(
             };
 
             bufs.out.clear();
-            let count = render_file_into(path, buf, &matcher, pattern, ctx, render, &mut bufs.out);
+            let count = if use_indexed_path {
+                let hits = indexed_hits_by_file.get(path).expect("path present");
+                render_line_hits(path, buf, hits, render, &matcher, pattern, &mut bufs.out)
+            } else {
+                render_file_into(path, buf, &matcher, pattern, ctx, render, &mut bufs.out)
+            };
 
             if count > 0 {
                 total_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
@@ -414,6 +451,134 @@ pub fn search_persistent_render<W: Write + Send>(
     // / "file-level" / "bitmap-only" — we can resurrect that if the bench
     // line in cli.rs misses it.
     Ok((count, timing))
+}
+
+/// Render only the candidate lines (from a `LineHits` result) for a file.
+/// Jumps to each candidate byte offset and emits just that line — the rest
+/// of the file is never read. Caller is responsible for verifying the
+/// file passes all path/glob filters and that we have a zero-context,
+/// non-inverted render (chunk merging doesn't apply in that mode).
+///
+/// `hits` is consumed (sorted in place by byte offset).
+fn render_line_hits(
+    path: &Path,
+    buf: &[u8],
+    hits: &[(u32, u32)],
+    render: &RenderOpts,
+    matcher: &Matcher,
+    pattern: &str,
+    out_buf: &mut Vec<u8>,
+) -> usize {
+    if hits.is_empty() || buf.is_empty() {
+        return 0;
+    }
+    if !is_known_text_ext(path) && is_binary(buf) {
+        return 0;
+    }
+
+    // Sort by byte_offset so we walk the file in natural order.
+    let mut sorted: Vec<(u32, u32)> = hits.to_vec();
+    sorted.sort_by_key(|(_, off)| *off);
+
+    let lbl = needs_line_by_line(pattern);
+
+    // Compile the byte regex once for both colour highlighting and
+    // `--only-matching` substring enumeration (same rationale as in
+    // `render_file_into`).
+    let bytes_re: Option<regex::bytes::Regex> = if render.color || render.only_matching {
+        render
+            .pattern
+            .as_deref()
+            .and_then(|p| regex::bytes::Regex::new(p).ok())
+    } else {
+        None
+    };
+    let hl_re: Option<&regex::bytes::Regex> = if render.color {
+        bytes_re.as_ref()
+    } else {
+        None
+    };
+
+    // Compact path header string (rel_base / colour normalisation).
+    let path_str: std::borrow::Cow<str> = match render.rel_base.as_deref() {
+        Some(base) => {
+            let rel = path.strip_prefix(base).unwrap_or(path).to_string_lossy();
+            if std::path::MAIN_SEPARATOR == '/' {
+                rel
+            } else {
+                std::borrow::Cow::Owned(rel.replace(std::path::MAIN_SEPARATOR, "/"))
+            }
+        }
+        None => path.to_string_lossy(),
+    };
+
+    let mut header_emitted = false;
+    let mut match_count: usize = 0;
+
+    for &(line_no, byte_offset) in &sorted {
+        let line_start = byte_offset as usize;
+        if line_start >= buf.len() {
+            continue;
+        }
+        let line_end = memchr::memchr(b'\n', &buf[line_start..])
+            .map(|p| line_start + p)
+            .unwrap_or(buf.len());
+        let line_bytes = &buf[line_start..line_end];
+        let display_bytes = strip_trailing_cr(line_bytes);
+
+        // Trigram said "candidate" but the regex might still reject it
+        // (e.g. the trigram was inside a longer character class). Drop
+        // false positives silently — same as the file-level path.
+        if !matcher.has_match(line_bytes, lbl) {
+            continue;
+        }
+
+        if !header_emitted && render.heading {
+            emit_heading(out_buf, &path_str, render);
+            header_emitted = true;
+        }
+
+        if render.only_matching {
+            if let Some(ref re) = bytes_re {
+                for m in re.find_iter(display_bytes) {
+                    emit_line(
+                        out_buf,
+                        &path_str,
+                        line_no,
+                        &display_bytes[m.start()..m.end()],
+                        LineKind::Match,
+                        render,
+                        hl_re,
+                    );
+                    match_count += 1;
+                }
+            } else {
+                emit_line(
+                    out_buf,
+                    &path_str,
+                    line_no,
+                    display_bytes,
+                    LineKind::Match,
+                    render,
+                    hl_re,
+                );
+                match_count += 1;
+            }
+        } else {
+            emit_line(
+                out_buf,
+                &path_str,
+                line_no,
+                display_bytes,
+                LineKind::Match,
+                render,
+                hl_re,
+            );
+            match_count += 1;
+        }
+    }
+
+    match_count
 }
 
 #[cfg(test)]
