@@ -8,9 +8,7 @@
 use std::fs;
 use std::path::Path;
 
-use fast_grep::persist::{
-    build as build_index, load as load_index, update_incremental, IndexMeta,
-};
+use fast_grep::persist::{build as build_index, load as load_index, update_incremental, IndexMeta};
 
 fn write_files(tmp: &Path, files: &[(&str, &str)]) {
     for &(name, content) in files {
@@ -22,7 +20,7 @@ fn write_files(tmp: &Path, files: &[(&str, &str)]) {
 /// version. The on-disk trigram files are left untouched so a non-migrating
 /// loader would crash; the auto-migrating `load()` must rebuild instead.
 fn plant_old_index(tmp: &Path, idx_dir: &Path, fake_version: u32) {
-    build_index(tmp, idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp, idx_dir, true, &[], false, false, None).expect("build");
     let meta_path = idx_dir.join("meta.json");
     let mut meta: IndexMeta =
         serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
@@ -43,8 +41,7 @@ fn load_auto_migrates_old_version_index() {
     // Pre-load: meta reports version 1, not the current v4.
     {
         let meta: IndexMeta =
-            serde_json::from_str(&fs::read_to_string(idx_dir.join("meta.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&fs::read_to_string(idx_dir.join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta.version, 1);
     }
 
@@ -59,20 +56,13 @@ fn load_auto_migrates_old_version_index() {
     assert_eq!(meta.version, fast_grep::persist::INDEX_VERSION);
 
     // And the migrated index is searchable.
-    let hits: Vec<_> = fast_grep::searcher::search_persistent_timed(
-        &idx,
-        "beta",
-        None,
-        false,
-        &[],
-        &[],
-        &[],
-    )
-    .unwrap()
-    .0
-    .iter()
-    .map(|m| (m.path.file_name().unwrap().to_owned(), m.line_number))
-    .collect();
+    let hits: Vec<_> =
+        fast_grep::searcher::search_persistent_timed(&idx, "beta", None, false, &[], &[], &[])
+            .unwrap()
+            .0
+            .iter()
+            .map(|m| (m.path.file_name().unwrap().to_owned(), m.line_number))
+            .collect();
     assert_eq!(hits.len(), 1, "expected one hit for 'beta'");
 }
 
@@ -111,7 +101,10 @@ fn update_incremental_auto_migrates_old_version() {
 
     let idx = load_index(&idx_dir).expect("load after migrate-update");
     assert_eq!(idx.meta.version, fast_grep::persist::INDEX_VERSION);
-    assert_eq!(idx.meta.num_docs, 2, "both files should be in the rebuilt index");
+    assert_eq!(
+        idx.meta.num_docs, 2,
+        "both files should be in the rebuilt index"
+    );
 }
 
 #[test]
@@ -132,9 +125,15 @@ fn load_fails_when_old_index_has_no_root_dir() {
         main_num_docs: None,
         case_insensitive: false,
     };
-    fs::write(idx_dir.join("meta.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    fs::write(
+        idx_dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
 
-    let err = load_index(&idx_dir).err().expect("must reject orphan old-version meta");
+    let err = load_index(&idx_dir)
+        .err()
+        .expect("must reject orphan old-version meta");
     let msg = format!("{:#}", err);
     assert!(
         msg.contains("no root_dir recorded"),

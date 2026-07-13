@@ -388,8 +388,14 @@ mod tests {
         let mut idx = SparseIndex::with_case_insensitive(false);
         idx.add_document(Path::new("a.txt"), b"abcdefg");
         let m = idx.masks.get(b"abc").expect("mask for abc");
-        assert!(mask_bit(m, b'd'), "'d' must be recorded as a follower of 'abc'");
-        assert!(!mask_bit(m, b'e'), "'e' must NOT follow 'abc' (it's two bytes away)");
+        assert!(
+            mask_bit(m, b'd'),
+            "'d' must be recorded as a follower of 'abc'"
+        );
+        assert!(
+            !mask_bit(m, b'e'),
+            "'e' must NOT follow 'abc' (it's two bytes away)"
+        );
         // Trigram "def" is followed by 'g'.
         let last = idx.masks.get(b"def").expect("mask for def");
         assert!(mask_bit(last, b'g'), "'g' must follow 'def'");

@@ -225,6 +225,23 @@ pub enum Commands {
         /// Start daemon after building index
         #[arg(short = 'D', long)]
         daemon: bool,
+        /// BufWriter / BufReader buffer size (MiB) for the streaming build's
+        /// spill and merge I/O. Larger values cut down on `write()`/`read()`
+        /// syscalls — meaningful on Windows where syscall overhead dominates.
+        /// Default: 1 MiB. Range: 1..=256.
+        #[arg(long = "build-buffer-mb", value_name = "MB")]
+        build_buffer_mb: Option<usize>,
+        /// Soft cap on the number of files accumulated per chunk before the
+        /// chunk is spilled + merged. Larger chunks sort fewer times and
+        /// produce fewer spill files, but the in-RAM `Vec<PostingRecord>`
+        /// for the chunk grows proportionally. Default: 4096.
+        #[arg(long = "chunk-files", value_name = "N")]
+        chunk_files: Option<usize>,
+        /// Soft cap on accumulated raw file bytes per chunk (MiB). A chunk
+        /// is spilled when either `--chunk-files` or this target is reached
+        /// first. Default: 512 MiB.
+        #[arg(long = "chunk-bytes-mb", value_name = "MB")]
+        chunk_bytes_mb: Option<usize>,
     },
     /// Benchmark PATTERN search in DIR
     #[command(name = "bench")]
@@ -533,6 +550,9 @@ fn run_indexed_search(
             idx_path.display()
         );
         let build_start = Instant::now();
+        // Auto-build path uses default streaming config — the CLI flags on
+        // `index` are the right place to tune; an implicit one-time build
+        // shouldn't second-guess that.
         persist::build(
             search_path,
             idx_path,
@@ -540,6 +560,7 @@ fn run_indexed_search(
             &opts.file_type,
             true,
             opts.ignore_case,
+            None,
         )?;
         eprintln!("Index built in {:.2}s", build_start.elapsed().as_secs_f64());
     }
@@ -746,9 +767,36 @@ fn run_subcommand(
             dir,
             output,
             daemon,
+            build_buffer_mb,
+            chunk_files,
+            chunk_bytes_mb,
         } => {
             let idx_path = dir.join(&output);
             let start = Instant::now();
+            // Resolve streaming-build overrides from CLI flags. Any unset
+            // field falls back to `StreamingConfig::defaults`. We only build
+            // an override config when at least one flag was supplied — that
+            // way the no-flag case still uses the well-tested default path.
+            let cfg =
+                if build_buffer_mb.is_some() || chunk_files.is_some() || chunk_bytes_mb.is_some() {
+                    let mut c = crate::build::StreamingConfig::defaults_with_verbose(true);
+                    if let Some(mb) = build_buffer_mb {
+                        c.write_buffer_bytes = mb
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| anyhow::anyhow!("--build-buffer-mb overflows usize"))?;
+                    }
+                    if let Some(n) = chunk_files {
+                        c.chunk_files = n;
+                    }
+                    if let Some(mb) = chunk_bytes_mb {
+                        c.chunk_byte_target = mb
+                            .checked_mul(1024 * 1024)
+                            .ok_or_else(|| anyhow::anyhow!("--chunk-bytes-mb overflows usize"))?;
+                    }
+                    Some(c)
+                } else {
+                    None
+                };
             persist::build(
                 &dir,
                 &idx_path,
@@ -756,6 +804,7 @@ fn run_subcommand(
                 type_filter,
                 true,
                 case_insensitive,
+                cfg,
             )?;
             eprintln!("Index built in {:.2}s", start.elapsed().as_secs_f64());
             #[cfg(feature = "daemon")]
@@ -904,7 +953,7 @@ fn run_bench(
     let tmp_dir = std::env::temp_dir().join("fgr_bench_index");
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let start = Instant::now();
-    persist::build(dir, &tmp_dir, no_ignore, type_filter, false, false)?;
+    persist::build(dir, &tmp_dir, no_ignore, type_filter, false, false, None)?;
     let persist_build_time = start.elapsed();
 
     let start = Instant::now();

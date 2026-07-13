@@ -342,9 +342,8 @@ pub fn search_persistent_render<W: Write + Send>(
 
     // For LineHits with zero context and non-inverted output we can jump
     // straight to each candidate offset — skip scanning the whole file.
-    let use_indexed_path = matches!(result, SearchResult::LineHits(_))
-        && ctx.is_zero()
-        && !render.invert;
+    let use_indexed_path =
+        matches!(result, SearchResult::LineHits(_)) && ctx.is_zero() && !render.invert;
 
     let indexed_hits_by_file: std::collections::HashMap<PathBuf, Vec<(u32, u32)>> =
         if use_indexed_path {

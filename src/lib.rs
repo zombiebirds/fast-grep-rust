@@ -1,3 +1,4 @@
+pub mod build;
 pub mod casefold;
 #[cfg(feature = "daemon")]
 pub mod daemon;

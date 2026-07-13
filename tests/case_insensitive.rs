@@ -74,7 +74,7 @@ fn line_key(m: &Match, tmp: &Path) -> String {
 fn ci_index_matches_full_scan_for_ignore_case_patterns() {
     let tmp = setup();
     let idx_dir = tmp.path().join(".fgr-ci");
-    build_index(tmp.path(), &idx_dir, true, &[], false, true).expect("build CI index");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true, None).expect("build CI index");
     let idx = load_index(&idx_dir).expect("load");
     assert!(idx.has_ci(), "index should carry a CI companion");
 
@@ -97,7 +97,7 @@ fn ci_index_matches_full_scan_for_ignore_case_patterns() {
 fn ci_index_is_sound_for_unicode_case_fold() {
     let tmp = setup();
     let idx_dir = tmp.path().join(".fgr-ci");
-    build_index(tmp.path(), &idx_dir, true, &[], false, true).expect("build CI index");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true, None).expect("build CI index");
     let idx = load_index(&idx_dir).expect("load");
 
     // `(?i)kelvin` matches both the ASCII "kelvin" and the line that starts
@@ -118,7 +118,7 @@ fn cs_only_index_still_correct_for_ignore_case() {
     // the right lines (via the all-files path), matching a full scan.
     let tmp = setup();
     let idx_dir = tmp.path().join(".fgr-cs");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build CS index");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build CS index");
     let idx = load_index(&idx_dir).expect("load");
     assert!(!idx.has_ci());
 
@@ -132,7 +132,7 @@ fn cs_only_index_still_correct_for_ignore_case() {
 fn incremental_update_keeps_ci_index_in_sync() {
     let tmp = setup();
     let idx_dir = tmp.path().join(".fgr-ci");
-    build_index(tmp.path(), &idx_dir, true, &[], false, true).expect("build CI index");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true, None).expect("build CI index");
 
     // Add a new file with mixed-case content after the index was built.
     fs::write(tmp.path().join("gamma.ts"), "Goodbye MOON and STARS").unwrap();

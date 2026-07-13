@@ -34,8 +34,7 @@ fn mask_files_exist(idx_dir: &Path) -> bool {
 }
 
 fn ci_mask_files_exist(idx_dir: &Path) -> bool {
-    idx_dir.join("ngrams.ci.masks").exists()
-        && idx_dir.join("ngrams.ci.masks.lookup").exists()
+    idx_dir.join("ngrams.ci.masks").exists() && idx_dir.join("ngrams.ci.masks.lookup").exists()
 }
 
 /// Convenience: CRC32 of a 3-byte trigram, matching the index's key hash.
@@ -48,7 +47,7 @@ fn fresh_build_writes_mask_files() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "alpha bravo charlie\n")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build");
     assert!(
         mask_files_exist(&idx_dir),
         "CS mask files must be present after build"
@@ -64,7 +63,7 @@ fn ci_build_writes_cs_and_ci_masks() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "Alpha Bravo\n")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, true).expect("build CI");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true, None).expect("build CI");
     assert!(mask_files_exist(&idx_dir), "CS mask files present");
     assert!(ci_mask_files_exist(&idx_dir), "CI mask files present");
 }
@@ -75,7 +74,7 @@ fn mask_overlap_returns_true_for_actual_followers() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "abcdefg")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build");
 
     let idx = load_index(&idx_dir).expect("load");
     let h = tri_hash(b"abc");
@@ -101,7 +100,7 @@ fn mask_overlap_handles_multiple_candidate_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "abc 123")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build");
 
     let idx = load_index(&idx_dir).expect("load");
     let h_abc = tri_hash(b"abc");
@@ -125,7 +124,7 @@ fn mask_overlap_captures_cross_line_follower() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "abc\nxyz")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build");
 
     let idx = load_index(&idx_dir).expect("load");
     let h = tri_hash(b"bc\n");
@@ -143,7 +142,7 @@ fn ci_mask_reflects_folded_content() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "ABCdef")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, true).expect("build CI");
+    build_index(tmp.path(), &idx_dir, true, &[], false, true, None).expect("build CI");
 
     let idx = load_index(&idx_dir).expect("load CI");
     let h_abc = tri_hash(b"abc");
@@ -168,7 +167,7 @@ fn mask_overlap_is_no_pruning_for_unknown_trigram() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "hello world")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build");
 
     let idx = load_index(&idx_dir).expect("load");
     // "zzz" doesn't appear anywhere.
@@ -188,7 +187,7 @@ fn backward_compat_loads_index_without_mask_files() {
     let tmp = tempfile::tempdir().unwrap();
     write_files(tmp.path(), &[("a.txt", "alpha beta\n")]);
     let idx_dir = tmp.path().join(".fgr");
-    build_index(tmp.path(), &idx_dir, true, &[], false, false).expect("build");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None).expect("build");
 
     // Remove the mask files post-build to simulate an older index.
     fs::remove_file(idx_dir.join("ngrams.masks")).unwrap();
@@ -210,19 +209,12 @@ fn backward_compat_loads_index_without_mask_files() {
     );
 
     // And the searcher still works on the unmasked index.
-    let hits: Vec<_> = fast_grep::searcher::search_persistent_timed(
-        &idx,
-        "beta",
-        None,
-        false,
-        &[],
-        &[],
-        &[],
-    )
-    .unwrap()
-    .0
-    .iter()
-    .map(|m| (m.path.file_name().unwrap().to_owned(), m.line_number))
-    .collect();
+    let hits: Vec<_> =
+        fast_grep::searcher::search_persistent_timed(&idx, "beta", None, false, &[], &[], &[])
+            .unwrap()
+            .0
+            .iter()
+            .map(|m| (m.path.file_name().unwrap().to_owned(), m.line_number))
+            .collect();
     assert_eq!(hits.len(), 1, "search must still return the 'beta' hit");
 }

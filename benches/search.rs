@@ -82,7 +82,13 @@ fn bench_patterns(c: &mut Criterion) {
             b.iter(|| {
                 with_index(&dir, |idx| {
                     fast_grep::searcher::search_persistent_timed(
-                        idx, pattern, None, false, &[], &[], &[],
+                        idx,
+                        pattern,
+                        None,
+                        false,
+                        &[],
+                        &[],
+                        &[],
                     )
                     .unwrap();
                 });

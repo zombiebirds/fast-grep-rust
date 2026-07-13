@@ -229,7 +229,11 @@ impl PersistentIndex {
             use std::sync::atomic::{AtomicU64, Ordering};
             static SEQ: AtomicU64 = AtomicU64::new(0);
             let n = SEQ.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("fgr-empty-mmap-{}-{}.bin", std::process::id(), n));
+            let path = std::env::temp_dir().join(format!(
+                "fgr-empty-mmap-{}-{}.bin",
+                std::process::id(),
+                n
+            ));
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -954,7 +958,10 @@ impl PersistentIndex {
 /// the indexing pass. Each mask entry is a fixed 256-bit (8 × u32) bitmap
 /// written verbatim in the order of the trigram list, so the lookup table
 /// can be shared with the postings lookup (same hash → same row).
-fn write_ngram_files(
+///
+/// Public so the streaming build's single-chunk fast path can re-use the
+/// legacy serializer instead of spilling + k-way-merging.
+pub fn write_ngram_files(
     output: &Path,
     prefix: &str,
     ngrams: &HashMap<[u8; 3], TrigramBuilder>,
@@ -1078,28 +1085,40 @@ pub fn build(
     type_filter: &[String],
     verbose: bool,
     case_insensitive: bool,
+    build_config: Option<crate::build::StreamingConfig>,
 ) -> Result<()> {
     if verbose {
         eprintln!("Building index for {:?}...", root);
     }
 
-    let index =
-        SparseIndex::build_from_directory(root, no_ignore, type_filter, verbose, case_insensitive)?;
-
     fs::create_dir_all(output).context("creating output directory")?;
 
-    // Collect file mtimes
+    // Caller-supplied overrides win; otherwise default with `verbose` set.
+    let cfg = build_config
+        .unwrap_or_else(|| crate::build::StreamingConfig::defaults_with_verbose(verbose));
+    let paths = crate::build::collect_paths(root, output, no_ignore, type_filter)?;
+    let result = crate::build::streaming_build_from_paths(&paths, case_insensitive, &cfg, output)?;
+
+    // Collect per-file mtimes keyed by the canonical string form. Same scheme
+    // the legacy path used (see comment at `write_index_files`).
     let mut file_mtimes = HashMap::new();
-    for path in &index.doc_ids {
+    for path in &result.indexed_paths {
         if let Ok(m) = fs::metadata(path) {
             file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
         }
     }
 
-    // Collect directory mtimes for fast stale detection
     let dir_mtimes = collect_dir_mtimes(root, no_ignore, Some(output));
 
-    let postings_len = write_index_files(output, &index, root, file_mtimes, dir_mtimes)?;
+    write_docids_and_meta(
+        output,
+        &result.indexed_paths,
+        result.num_ngrams,
+        root,
+        file_mtimes,
+        dir_mtimes,
+        case_insensitive,
+    )?;
 
     // Clean up any delta files and stale lock from previous runs
     let _ = fs::remove_file(output.join("lock"));
@@ -1107,10 +1126,10 @@ pub fn build(
     if verbose {
         eprintln!(
             "Index built: {} docs, {} trigrams, postings {}KB{}",
-            index.doc_ids.len(),
-            index.ngrams.len(),
-            postings_len / 1024,
-            if index.ngrams_ci.is_some() {
+            result.num_docs,
+            result.num_ngrams,
+            result.postings_len / 1024,
+            if case_insensitive {
                 " (+ case-insensitive index)"
             } else {
                 ""
@@ -1121,10 +1140,73 @@ pub fn build(
     Ok(())
 }
 
+/// Write `docids.bin` and `meta.json` to `output` for a streaming-built
+/// index. The streaming path emits `ngrams.*` (and `ngrams.ci.*` when
+/// applicable) directly, so this helper handles only the bookkeeping files
+/// plus the stale-file cleanup. Shared between `persist::build` and
+/// `persist::compact` so the on-disk layout stays consistent regardless of
+/// how the trigram store was produced.
+fn write_docids_and_meta(
+    output: &Path,
+    paths: &[PathBuf],
+    num_ngrams: usize,
+    root: &Path,
+    file_mtimes: HashMap<String, u64>,
+    dir_mtimes: HashMap<String, u64>,
+    case_insensitive: bool,
+) -> Result<()> {
+    // Write docids.bin (same format as the legacy path: u16 length prefix
+    // then UTF-8 bytes for each path, in the same order as indexed).
+    let docids_path = output.join("docids.bin");
+    {
+        let mut docids_file = BufWriter::new(File::create(&docids_path)?);
+        for path in paths {
+            let path_bytes = path.to_string_lossy();
+            let bytes = path_bytes.as_bytes();
+            docids_file.write_u16::<LittleEndian>(bytes.len() as u16)?;
+            docids_file.write_all(bytes)?;
+        }
+        docids_file.flush()?;
+    }
+
+    let meta = IndexMeta {
+        version: INDEX_VERSION,
+        num_docs: paths.len(),
+        num_ngrams,
+        root_dir: root.to_string_lossy().into_owned(),
+        built_at: chrono_now(),
+        file_mtimes,
+        dir_mtimes,
+        main_num_docs: Some(paths.len()),
+        case_insensitive,
+    };
+    let meta_path = output.join("meta.json");
+    let meta_json = serde_json::to_string_pretty(&meta)?;
+    fs::write(&meta_path, meta_json)?;
+
+    // If the corpus used to be CI and is now CS, drop the now-stale
+    // ngrams.ci.* files so the index dir describes its actual mode.
+    if !case_insensitive {
+        remove_ci_files(output);
+    }
+
+    // Old bitmap files are overwritten by the new ones above; delta files
+    // and lock are cleared so the directory describes a clean main index.
+    let _ = fs::remove_file(output.join("delta.postings"));
+    let _ = fs::remove_file(output.join("delta.lookup"));
+    let _ = fs::remove_file(output.join("delta.docids"));
+    let _ = fs::remove_file(output.join("deleted.bin"));
+    let _ = fs::remove_file(output.join("delta.ci.postings"));
+    let _ = fs::remove_file(output.join("delta.ci.lookup"));
+
+    Ok(())
+}
+
 /// Serialize a fully-built `SparseIndex` to disk under `output`, writing the
 /// trigram store, optional CI companion, docids table, and `meta.json`. Also
 /// removes any stale delta + lock files from a prior incremental run so the
 /// directory describes a single, self-contained main index.
+#[allow(dead_code)] // legacy fallback; the streaming path uses `write_docids_and_meta` + `merge_to_store` directly.
 fn write_index_files(
     output: &Path,
     index: &SparseIndex,
@@ -1142,7 +1224,10 @@ fn write_index_files(
         // for defensive symmetry with the CS path.
         static EMPTY: std::sync::OnceLock<HashMap<[u8; 3], crate::index::FollowerMask>> =
             std::sync::OnceLock::new();
-        let ci_masks = index.masks_ci.as_ref().unwrap_or_else(|| EMPTY.get_or_init(HashMap::new));
+        let ci_masks = index
+            .masks_ci
+            .as_ref()
+            .unwrap_or_else(|| EMPTY.get_or_init(HashMap::new));
         write_ngram_files(output, "ngrams.ci", ci, ci_masks)?;
     } else {
         // A prior CI build over this directory may have left stale CI files.
@@ -1367,7 +1452,7 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
         // (which may not be filtered by .gitignore on every system) doesn't
         // index its own .postings/.lookup files as if they were sources.
         let _ = fs::remove_dir_all(index_path);
-        build(root, index_path, false, &[], false, ci)
+        build(root, index_path, false, &[], false, ci, None)
             .context("auto-migrating older index")?;
         // Recurse into the freshly-built v4 index. Recursion is bounded:
         // build() writes the current INDEX_VERSION, so the recursive call
@@ -1478,17 +1563,9 @@ pub fn load(index_path: &Path) -> Result<PersistentIndex> {
     } else {
         None
     } {
-        Some((lm, lc, pm, bm, blm, bc, mm, mlm, mc)) => (
-            Some(lm),
-            lc,
-            Some(pm),
-            bm,
-            blm,
-            bc,
-            mm,
-            mlm,
-            mc,
-        ),
+        Some((lm, lc, pm, bm, blm, bc, mm, mlm, mc)) => {
+            (Some(lm), lc, Some(pm), bm, blm, bc, mm, mlm, mc)
+        }
         None => (None, 0, None, None, None, 0, None, None, 0),
     };
     let (delta_lookup_ci, delta_postings_ci) = read_delta(
@@ -1610,8 +1687,8 @@ pub fn compact(index_path: &Path, verbose: bool) -> Result<CompactStats> {
     // 3. Acquire the index lock so a concurrent `update_incremental` can't
     //    clobber our rewrite of the main files. The lock is released on drop
     //    of the file handle at end of scope.
-    let (_lock, _waited) = acquire_index_lock(index_path)
-        .context("acquiring index lock for compact")?;
+    let (_lock, _waited) =
+        acquire_index_lock(index_path).context("acquiring index lock for compact")?;
 
     if verbose {
         eprintln!(
@@ -1622,26 +1699,37 @@ pub fn compact(index_path: &Path, verbose: bool) -> Result<CompactStats> {
         );
     }
 
-    // 4. Reindex the effective file list (skips the directory walk — we
-    //    already know exactly which files belong to the corpus).
-    let index = SparseIndex::build_from_paths(&effective_paths, ci_enabled, verbose)?;
+    // 4. Reindex the effective file list with the streaming path
+    //    (skips the directory walk — we already know exactly which files
+    //    belong to the corpus).
+    let cfg = crate::build::StreamingConfig::defaults_with_verbose(verbose);
+    let result =
+        crate::build::streaming_build_from_paths(&effective_paths, ci_enabled, &cfg, index_path)?;
 
     // 5. Refresh mtime caches: every file we're now indexing should carry its
     //    current mtime, and we don't trust stale ones.
-    let mut file_mtimes = HashMap::with_capacity(index.doc_ids.len());
-    for path in &index.doc_ids {
+    let mut file_mtimes = HashMap::with_capacity(result.indexed_paths.len());
+    for path in &result.indexed_paths {
         if let Ok(m) = fs::metadata(path) {
             file_mtimes.insert(path.to_string_lossy().into_owned(), mtime_secs(&m));
         }
     }
     let dir_mtimes = collect_dir_mtimes(Path::new(&root_dir), false, Some(index_path));
 
-    // 6. Write the fresh main index files (overwrites existing ngrams.* and
-    //    docids.bin, then clears delta + deleted + lock).
+    // 6. Write docids.bin + meta.json + cleanup (the streaming path already
+    //    produced ngrams.* and ngrams.ci.* directly into `index_path`).
     let root = Path::new(&root_dir);
-    write_index_files(index_path, &index, root, file_mtimes, dir_mtimes)?;
+    write_docids_and_meta(
+        index_path,
+        &result.indexed_paths,
+        result.num_ngrams,
+        root,
+        file_mtimes,
+        dir_mtimes,
+        ci_enabled,
+    )?;
 
-    let after_total = index.doc_ids.len();
+    let after_total = result.num_docs as usize;
 
     if verbose {
         eprintln!(
@@ -1692,7 +1780,7 @@ pub fn update_incremental(index_path: &Path, root: &Path, verbose: bool) -> Resu
         // See the matching note in load() — wipe the index dir first so the
         // rebuild walk doesn't index its own files.
         let _ = fs::remove_dir_all(index_path);
-        build(root, index_path, false, &[], false, ci)
+        build(root, index_path, false, &[], false, ci, None)
             .context("auto-migrating older index before update")?;
         // After the rebuild there's nothing to incrementally update — the
         // rebuild already re-walked the whole tree. Return an empty stats

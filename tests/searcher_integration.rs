@@ -74,7 +74,7 @@ fn setup_test_dir() -> tempfile::TempDir {
 /// collide with anything the search results might match.
 fn build_test_index(tmp: &Path) -> PersistentIndex {
     let idx_dir = tmp.join(".fgr-test");
-    build_index(tmp, &idx_dir, true, &[], false, false).expect("build persistent index");
+    build_index(tmp, &idx_dir, true, &[], false, false, None).expect("build persistent index");
     load_index(&idx_dir).expect("load persistent index")
 }
 
@@ -91,6 +91,77 @@ fn builds_index_with_correct_file_count() {
     let all_results = search(&idx, ".*");
     let files: HashSet<_> = all_results.iter().map(|m| m.path.clone()).collect();
     assert_eq!(files.len(), TEST_FILES.len());
+}
+
+#[test]
+fn fresh_index_keeps_docids_aligned_when_binary_file_is_skipped() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    fs::write(tmp.path().join("000-skip.bin"), b"\0not indexed text\n").unwrap();
+    fs::write(
+        tmp.path().join("target.c"),
+        "int main(void) {\n    RCtSvTempS_20msRunnable();\n    return 0;\n}\n",
+    )
+    .unwrap();
+
+    let idx_dir = tmp.path().join(".fgr-test");
+    build_index(tmp.path(), &idx_dir, true, &[], false, false, None)
+        .expect("build persistent index");
+    let idx = load_index(&idx_dir).expect("load persistent index");
+
+    assert_eq!(
+        idx.meta.num_docs, 1,
+        "metadata must count only files accepted by the streaming builder"
+    );
+    assert_eq!(
+        idx.docid_offsets.len(),
+        1,
+        "docids.bin must stay aligned with compact posting doc IDs"
+    );
+
+    let c_filter = vec!["c".to_string()];
+    let mut indexed: Vec<_> = search_persistent_timed(
+        &idx,
+        "RCtSvTempS_20msRunnable",
+        None,
+        false,
+        &c_filter,
+        &[],
+        &[],
+    )
+    .expect("indexed search")
+    .0
+    .iter()
+    .map(|m| {
+        (
+            m.path.strip_prefix(tmp.path()).unwrap().to_path_buf(),
+            m.line_number,
+        )
+    })
+    .collect();
+    indexed.sort();
+
+    let mut full: Vec<_> = search_full_scan(
+        tmp.path(),
+        "RCtSvTempS_20msRunnable",
+        true,
+        false,
+        &c_filter,
+        &[],
+        &[],
+        false,
+    )
+    .expect("full scan")
+    .iter()
+    .map(|m| {
+        (
+            m.path.strip_prefix(tmp.path()).unwrap().to_path_buf(),
+            m.line_number,
+        )
+    })
+    .collect();
+    full.sort();
+
+    assert_eq!(indexed, full, "indexed search must match full scan");
 }
 
 #[test]

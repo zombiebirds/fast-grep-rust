@@ -1,3 +1,4 @@
+mod build;
 mod casefold;
 mod cli;
 #[cfg(feature = "daemon")]

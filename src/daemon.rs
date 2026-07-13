@@ -157,10 +157,7 @@ impl Daemon {
         if stats.before_delta > 0 || stats.deleted_reclaimed > 0 {
             eprintln!(
                 "[daemon] Compacted: reclaimed {} deleted, merged {} delta → {} docs in {}ms",
-                stats.deleted_reclaimed,
-                stats.before_delta,
-                stats.after_total,
-                stats.duration_ms,
+                stats.deleted_reclaimed, stats.before_delta, stats.after_total, stats.duration_ms,
             );
         }
         Ok(())
